@@ -127,15 +127,22 @@ QUEUED → RUNNING → SUCCEEDED / FAILED / CANCELED
 
 规划:抢占规则;由框架自动包裹(作者忘不掉的保险)。
 
-### 4.7 持久化与恢复(M2)
+### 4.7 持久化与恢复(已实现,M2 核心)
 
 BT.CPP 无法快照"哪个节点正在 RUNNING"(那是 C++ 调用栈状态)。务实路线:
 
-- **事件日志**:每次状态迁移落 journal(与观测数据一鱼两吃)
-- **Checkpoint 装饰器 + 幂等声明**:业务安全点显式声明;节点声明幂等性(query 可重放,charge 不可)
-- 恢复 = 重载黑板 + 重入树,已完成 checkpoint 段短路跳过
+- **Journal 事件日志**(✅):任务生命周期事件(submitted/started/checkpoint/
+  checkpoint_restored/finished)记录在任务上并可经 sink 回调落盘——观测与恢复一鱼两吃。
+  `TaskHandle::journal()` 取快照;`Engine::setJournalSink()` 持久化(每事件一行 JSON)。
+- **Checkpoint 装饰器**(✅):子节点 SUCCESS 时捕获**全量黑板快照**(排除框架键,
+  支持 string/int/int64/double/bool/vector<string>)记入 journal
+- **断点恢复**(✅):`TaskSpec.resume_journal` = 上一轮 journal(内存传递或落盘后跨进程读回),
+  提交同一棵树:已完成的 Checkpoint **跳过子节点**、恢复黑板快照——
+  上一轮已提交的副作用不重复执行(业务节点需幂等,见反目标)
+- 恢复语义演示:`examples/robot_delivery` 场景 C——递交失败重跑,搜寻/抓取整体跳过
 
-不做"树中间任意位置断点续跑"。
+不做"树中间任意位置断点续跑"。规划:checkpoint 的原子落盘(配 WAL)、
+resume 时的树版本一致性校验。
 
 ### 4.8 树包与版本(M3)
 
@@ -147,7 +154,8 @@ BT.CPP 无法快照"哪个节点正在 RUNNING"(那是 C++ 调用栈状态)。�
 |---|---|---|
 | **M0 ✅** | 核心骨架:调度器 / SDK / Bridge / ForEach / 失败记录 / explain / 取消 | hello_tree 跑通;单测覆盖同步/异步/遍历/取消/定时器 |
 | **M1 ✅** | 类型化 schema 校验(L1+L2)✅;策略(超时 ✅ / RetryWithDelay ✅ / 墙钟预算 ✅);失败自动捕获 ✅;`nebula validate` CLI ✅ | **试金石通过**:`examples/robot_delivery` 演示典型"拣选-递送"业务,搜寻段 N 份复制 → 1 份数据驱动,全树在 schema 严格模式下自洽 |
-| M2 | journal + checkpoint 恢复;explain 完整版(耗时/尝试次数);journal 回放回归 | kill -9 后断点续跑演示 |
+| **M2(核心已达成)** | journal 事件日志 ✅;Checkpoint 装饰器 ✅;断点恢复(含跨进程)✅;动态树原语补齐(WhileLoop/SwitchN)✅ | 恢复演示:递交失败重跑,已完成段整体跳过、副作用不重复;17 组单测 |
+| M2 收尾 | explain 完整版(节点耗时/attempt);journal 回放回归工具 | kill -9 后断点续跑演示 |
 | M3 | 树包版本化与灰度路由;Mock 自动生成;自动流程文档 | 1.0 发布 |
 
 ## 6. 已知限制
@@ -156,6 +164,8 @@ BT.CPP 无法快照"哪个节点正在 RUNNING"(那是 C++ 调用栈状态)。�
 - 未提供 schema 时,slots 注入规则为 string / array→vector<string> / 其它 dump;
   提供后标量类型按真实类型注入
 - L2 数据流检查不覆盖 Script/ScriptCondition 代码串中引用的键
+- Checkpoint 快照支持 string/int/int64/double/bool/vector<string>,其它类型跳过;
+  不做原子落盘(进程崩溃瞬间正在写的 journal 行可能不完整,恢复侧应容错解析)
 - Engine 析构时未完成任务直接终止(halt 不会被调用),析构前应确保任务完成或取消
 - `ForEachNode` 仅支持 string 集合;结构化元素待后续类型系统
 

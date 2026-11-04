@@ -46,9 +46,11 @@ endif()
 
 add_library(nebulabt
   src/core/failure.cpp
+  src/core/journal.cpp
   src/core/scheduler.cpp
   src/core/schema.cpp
   src/core/engine.cpp
+  src/nodes/checkpoint.cpp
   src/nodes/for_each.cpp
   src/nodes/retry_with_delay.cpp
   src/nodes/switch_n.cpp

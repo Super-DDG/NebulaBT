@@ -28,6 +28,8 @@ public:
   /// 任务终态回调(在调度线程执行,应当快速返回)
   using FinishedCallback = std::function<void(TaskHandle)>;
   using LogCallback = std::function<void(LogLevel, const std::string&)>;
+  /// journal 事件回调(调度线程执行;持久化即在此落盘,每事件一行 JSON)
+  using JournalSink = std::function<void(const JournalEvent&)>;
 
   Engine();
   ~Engine();
@@ -48,6 +50,9 @@ public:
                                     const nlohmann::json& schema = {});
 
   void onFinished(FinishedCallback cb);
+
+  /// journal 事件回调(提交/启动/检查点/终态;持久化即在此写文件/DB)
+  void setJournalSink(JournalSink cb);
 
   /// 日志回调(默认输出到 stderr)
   void setLogger(LogCallback cb);

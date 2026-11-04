@@ -22,6 +22,7 @@
 #include <nebulabt/sdk/action.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -41,6 +42,8 @@ struct MockWorld {
   std::map<std::string, std::map<std::string, int>> vision;
   int grasp_fail_times = 0;  // 前 N 次抓取失败(演示重试挽回)
   int grasp_attempts = 0;
+  int handover_fail_times = 0;  // 前 N 次递交失败(演示检查点恢复)
+  int handover_attempts = 0;
 
   int countAt(const std::string& loc, const std::string& prompt) const {
     auto it = vision.find(loc);
@@ -52,6 +55,8 @@ struct MockWorld {
   void reset() {
     grasp_attempts = 0;
     grasp_fail_times = 0;
+    handover_attempts = 0;
+    handover_fail_times = 0;
   }
 };
 
@@ -236,17 +241,31 @@ private:
   std::shared_ptr<MockWorld> world_;
 };
 
-// 递交(异步)
+// 递交(异步;可注入失败,演示"递交段失败 -> 带检查点恢复重跑")
 class HandoverItem : public NebulaAction {
 public:
+  explicit HandoverItem(std::shared_ptr<MockWorld> world) : world_(std::move(world)) {}
   BT::PortsList providedPorts() const override { return {}; }
-  BT::NodeStatus start(NebulaCtx&, const Done& done) override {
-    std::thread([done] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      done(BT::NodeStatus::SUCCESS, {});
-    }).detach();
+  BT::NodeStatus start(NebulaCtx& ctx, const Done& done) override {
+    const int attempt = ++world_->handover_attempts;
+    if (attempt <= world_->handover_fail_times) {
+      ctx.fail("HANDOVER_FAILED", "receiver not ready, attempt " +
+                                      std::to_string(attempt));
+      std::thread([done] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        done(BT::NodeStatus::FAILURE, {});
+      }).detach();
+    } else {
+      std::thread([done] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        done(BT::NodeStatus::SUCCESS, {});
+      }).detach();
+    }
     return BT::NodeStatus::RUNNING;
   }
+
+private:
+  std::shared_ptr<MockWorld> world_;
 };
 
 // TTS 播报(同步)
@@ -273,22 +292,31 @@ static const char* kXml = R"(
       <PlanLocations target_location="{target_location}" locations="{locations}"/>
 
       <!-- 零复制核心:同一份"导航+检测+确认"逻辑,数据驱动遍历所有候选地点 -->
-      <ForEach array="{locations}" element="{loc}" continue_on_failure="true">
-        <Sequence name="search_at">
-          <NavigateTo point_id="{loc}"/>
-          <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
-          <RequireFound count="{count}" display_name="{display_name}" loc="{loc}"/>
+      <!-- M2 检查点:搜寻 完成 -> 黑板快照(loc/oid/prompt 等)入 journal -->
+      <Checkpoint id="search_done">
+        <Sequence name="search_block">
+          <ForEach array="{locations}" element="{loc}" continue_on_failure="true">
+            <Sequence name="search_at">
+              <NavigateTo point_id="{loc}"/>
+              <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
+              <RequireFound count="{count}" display_name="{display_name}" loc="{loc}"/>
+            </Sequence>
+          </ForEach>
+          <AssertFound count="{count}" display_name="{display_name}"/>
         </Sequence>
-      </ForEach>
+      </Checkpoint>
 
-      <AssertFound count="{count}" display_name="{display_name}"/>
       <Speak text="Found the item. Starting grasp."/>
-      <RetryWithDelay attempts="{grasp_retry}" delay_ms="300">
-        <Sequence>
-          <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
-          <GraspItem object_id="{oid}"/>
-        </Sequence>
-      </RetryWithDelay>
+
+      <!-- M2 检查点:抓取 完成 -> 递交失败恢复重跑时,搜寻与抓取整体跳过 -->
+      <Checkpoint id="grasp_done">
+        <RetryWithDelay attempts="{grasp_retry}" delay_ms="300">
+          <Sequence>
+            <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
+            <GraspItem object_id="{oid}"/>
+          </Sequence>
+        </RetryWithDelay>
+      </Checkpoint>
 
       <NavigateTo point_id="handover_point"/>
       <Speak text="Here is your item, please take it."/>
@@ -301,9 +329,22 @@ static const char* kXml = R"(
 // ---------------------------------------------------------------------------
 // 场景驱动
 // ---------------------------------------------------------------------------
+// 最近一次任务的事件日志(场景 C 用作 resume_journal)
+static nlohmann::json lastJournal = nlohmann::json::array();
+
+#define CHECK(cond)                                                            \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      std::cerr << "CHECK failed: " #cond " (line " << __LINE__ << ")\n";     \
+      std::cout << "\nrobot_delivery FAILED\n";                                \
+      std::exit(1);                                                            \
+    }                                                                          \
+  } while (0)
+
 static TaskState runDelivery(Engine& engine, MockWorld& world,
                              const std::string& item,
-                             const std::string& location, int graspRetry) {
+                             const std::string& location, int graspRetry,
+                             nlohmann::json resumeJournal = {}) {
   TaskSpec spec;
   spec.task_type = "DELIVER_ORDER";
   spec.timeout_ms = 60000;  // 任务级超时兜底(策略引擎)
@@ -321,6 +362,7 @@ static TaskState runDelivery(Engine& engine, MockWorld& world,
   spec.slots["target_item"] = item;
   spec.slots["target_location"] = location;
   spec.slots["grasp_retry"] = graspRetry;
+  spec.resume_journal = std::move(resumeJournal);
 
   auto task = engine.submitFromText(kXml, spec);
   const TaskState state = task.wait();
@@ -331,8 +373,15 @@ static TaskState runDelivery(Engine& engine, MockWorld& world,
     std::cout << "    - [" << f.code << "] " << f.node << ": " << f.message
               << "\n";
   }
+  // 供恢复场景使用:整体事件日志(submitted/started/checkpoint/finished)
+  nlohmann::json j = nlohmann::json::array();
+  for (const auto& e : task.journal()) {
+    j.push_back(e);
+  }
+  lastJournal = std::move(j);
   return state;
 }
+
 
 int main() {
   auto world = std::make_shared<MockWorld>();
@@ -346,7 +395,7 @@ int main() {
   engine.registerAction("RequireFound", std::make_shared<RequireFound>());
   engine.registerAction("AssertFound", std::make_shared<AssertFound>());
   engine.registerAction("GraspItem", std::make_shared<GraspItem>(world));
-  engine.registerAction("HandoverItem", std::make_shared<HandoverItem>());
+  engine.registerAction("HandoverItem", std::make_shared<HandoverItem>(world));
   engine.registerAction("Speak", std::make_shared<Speak>());
 
   engine.setLogger([](LogLevel, const std::string& msg) {
@@ -364,8 +413,27 @@ int main() {
   world->reset();
   const TaskState stateB = runDelivery(engine, *world, "toy_duck", "", 3);
 
+  // 场景 C(M2):递交段失败 -> 带 journal 恢复重跑
+  // 第一轮:搜寻/抓取正常,递交时"接收人没准备好" -> FAILED
+  std::cout << "\n=== Scenario C: handover fails, then resume from journal ===\n";
+  world->reset();
+  world->vision["shelf_b"]["water bottle"] = 2;
+  world->handover_fail_times = 1;
+  const int graspsBefore = 0;
+  const TaskState stateC1 = runDelivery(engine, *world, "water_bottle", "", 3);
+  const int graspsAfterRun1 = world->grasp_attempts;
+  CHECK(graspsAfterRun1 > graspsBefore);
+
+  // 第二轮:同一棵树 + 上一轮 journal -> search_done/grasp_done 检查点命中,
+  // 搜寻与抓取整体跳过(黑板快照恢复),只重跑递交段 -> SUCCEEDED
+  const TaskState stateC2 = runDelivery(engine, *world, "water_bottle", "", 3,
+                                        lastJournal);
+  CHECK(world->grasp_attempts == graspsAfterRun1);  // 抓取没有重复执行!
+
   const bool ok = (stateA == TaskState::Succeeded) &&
-                  (stateB == TaskState::Failed);
+                  (stateB == TaskState::Failed) &&
+                  (stateC1 == TaskState::Failed) &&
+                  (stateC2 == TaskState::Succeeded);
   std::cout << "\nrobot_delivery " << (ok ? "PASSED" : "FAILED") << "\n";
   return ok ? 0 : 1;
 }

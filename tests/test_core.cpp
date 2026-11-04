@@ -530,6 +530,146 @@ static void test_retry_budget() {
   CHECK(elapsedMs < 2000);
 }
 
+// M2:journal + checkpoint 测试节点
+class SideEffect : public NebulaAction {
+public:
+  std::atomic<int> calls{0};
+  BT::PortsList providedPorts() const override { return {}; }
+  NodeStatus start(NebulaCtx&, const Done&) override {
+    calls.fetch_add(1);
+    return NodeStatus::SUCCESS;
+  }
+};
+
+static void test_journal_events() {
+  Engine engine;
+  engine.registerAction("Ok", std::make_shared<Ok>());
+
+  std::atomic<int> sink_count{0};
+  engine.setJournalSink([&](const JournalEvent&) { sink_count.fetch_add(1); });
+
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t"><Ok/></BehaviorTree></root>)");
+  CHECK(task.wait() == TaskState::Succeeded);
+
+  auto j = task.journal();
+  CHECK(j.size() == 3);  // submitted / started / finished
+  CHECK(j[0].event == "submitted");
+  CHECK(j[1].event == "started");
+  CHECK(j[2].event == "finished");
+  CHECK(j[2].data["state"] == "SUCCEEDED");
+  CHECK(sink_count.load() == 3);  // sink 与内存 journal 同步收到
+}
+
+static void test_checkpoint_resume() {
+  // 树:Writer(写黑板) -> Checkpoint -> SideEffect(副作用) -> Gate(首轮失败)
+  Engine engine;
+  auto side = std::make_shared<SideEffect>();
+  engine.registerAction("SideEffect", side);
+  engine.registerAction("Writer", std::make_shared<Writer>());
+  engine.registerAction("Ok", std::make_shared<Ok>());
+
+  class Gate : public NebulaAction {
+  public:
+    std::atomic<bool> open{false};
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx& ctx, const Done&) override {
+      if (!open.load()) {
+        ctx.fail("GATE_CLOSED", "gate closed on first run");
+        return NodeStatus::FAILURE;
+      }
+      return NodeStatus::SUCCESS;
+    }
+  };
+  auto gate = std::make_shared<Gate>();
+  engine.registerAction("Gate", gate);
+
+  static const char* kXml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Sequence>
+        <Writer value="{k}"/>
+        <Checkpoint id="cp1">
+          <SideEffect/>
+        </Checkpoint>
+        <Gate/>
+      </Sequence>
+    </BehaviorTree></root>)";
+
+  // 第一轮:Gate 关闭 -> FAILED;副作用已执行 1 次,检查点已记录
+  auto task1 = engine.submitFromText(kXml);
+  CHECK(task1.wait() == TaskState::Failed);
+  CHECK(side->calls.load() == 1);
+  bool hasCp = false;
+  for (const auto& e : task1.journal()) {
+    if (e.event == "checkpoint" && e.data["id"] == "cp1") hasCp = true;
+  }
+  CHECK(hasCp);
+
+  // 第二轮:带 resume_journal 提交,并打开 Gate
+  // 检查点命中 -> Writer 跳过(黑板恢复)、SideEffect 跳过(副作用不重复!)
+  gate->open.store(true);
+  TaskSpec spec;
+  spec.resume_journal = nlohmann::json::array();
+  for (const auto& e : task1.journal()) {
+    spec.resume_journal.push_back(e);
+  }
+  auto task2 = engine.submitFromText(kXml, spec);
+  CHECK(task2.wait() == TaskState::Succeeded);
+  CHECK(side->calls.load() == 1);  // 副作用没有重复执行!
+
+  bool hasRestore = false;
+  for (const auto& e : task2.journal()) {
+    if (e.event == "checkpoint_restored" && e.data["id"] == "cp1")
+      hasRestore = true;
+  }
+  CHECK(hasRestore);
+}
+
+static void test_checkpoint_resume_across_engines() {
+  // 模拟跨进程恢复:sink 落盘(每事件一行 JSON)-> 新 Engine 读回 -> 恢复
+  static const char* kXml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Sequence>
+        <Writer value="{k}"/>
+        <Checkpoint id="cp1">
+          <SideEffect/>
+        </Checkpoint>
+        <Ok/>
+      </Sequence>
+    </BehaviorTree></root>)";
+
+  std::vector<std::string> persisted;
+  {
+    Engine engine;
+    auto side = std::make_shared<SideEffect>();
+    engine.registerAction("SideEffect", side);
+    engine.registerAction("Writer", std::make_shared<Writer>());
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    engine.setJournalSink([&](const JournalEvent& e) {
+      persisted.push_back(nlohmann::json(e).dump());
+    });
+
+    auto task = engine.submitFromText(kXml);
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(side->calls.load() == 1);
+  }  // "进程退出"
+
+  // 新进程:读回 journal,恢复执行
+  Engine engine;
+  auto side = std::make_shared<SideEffect>();
+  engine.registerAction("SideEffect", side);
+  engine.registerAction("Writer", std::make_shared<Writer>());
+  engine.registerAction("Ok", std::make_shared<Ok>());
+
+  TaskSpec spec;
+  for (const auto& line : persisted) {
+    spec.resume_journal.push_back(nlohmann::json::parse(line));
+  }
+  auto task = engine.submitFromText(kXml, spec);
+  CHECK(task.wait() == TaskState::Succeeded);
+  CHECK(side->calls.load() == 0);  // 副作用从未在新进程中执行——检查点跳过
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -559,6 +699,12 @@ int main() {
   std::cout << "ok  while loop\n";
   test_switch_n();
   std::cout << "ok  switch n\n";
+  test_journal_events();
+  std::cout << "ok  journal events\n";
+  test_checkpoint_resume();
+  std::cout << "ok  checkpoint resume\n";
+  test_checkpoint_resume_across_engines();
+  std::cout << "ok  checkpoint resume across engines\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

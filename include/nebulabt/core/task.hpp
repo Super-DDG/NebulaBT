@@ -2,6 +2,7 @@
 /// 任务模型:TaskSpec(提交) / TaskHandle(查询、取消、explain)。
 
 #include "nebulabt/core/failure.hpp"
+#include "nebulabt/core/journal.hpp"
 #include <behaviortree_cpp/contrib/json.hpp>
 #include <memory>
 #include <string>
@@ -37,6 +38,10 @@ struct TaskSpec {
   /// 任务级超时(毫秒,0 = 不限制)。超时触发:halt 整棵树 +
   /// 记录 TASK_TIMEOUT 失败 + 终态 FAILED(策略引擎 M1 的第一块)
   uint64_t timeout_ms = 0;
+  /// 断点恢复(M2,可选):上一轮任务的事件日志(TaskHandle::journal()
+  /// 或 journal sink 落盘后的数组)。提交同一棵树时,已完成的 Checkpoint
+  /// 跳过子节点并恢复黑板——上一轮已提交的副作用不重复执行。
+  nlohmann::json resume_journal = nlohmann::json::array();
 };
 
 /// 任务句柄
@@ -58,6 +63,9 @@ public:
 
   /// 结构化失败快照
   std::vector<FailureRecord> failures() const;
+
+  /// 任务事件日志快照(可整体作为新任务的 resume_journal)
+  std::vector<JournalEvent> journal() const;
 
   /// 执行报告:树形结构 + 各节点状态 + 失败记录
   nlohmann::json explain() const;

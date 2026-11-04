@@ -2,6 +2,7 @@
 
 #include "nebulabt/core/scheduler.hpp"
 #include "nebulabt/core/schema.hpp"
+#include "nebulabt/nodes/checkpoint.hpp"
 #include "nebulabt/nodes/for_each.hpp"
 #include "nebulabt/nodes/retry_with_delay.hpp"
 #include "nebulabt/nodes/switch_n.hpp"
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -54,14 +56,21 @@ struct TaskContext {
   std::atomic<bool> finished{false};
   std::mutex wait_mu;
   std::condition_variable wait_cv;
+
+  // journal(M2):任务事件日志 + 已完成检查点的黑板快照
+  static constexpr size_t kJournalMax = 1000;
+  std::mutex journal_mu;
+  std::vector<JournalEvent> journal;
+  std::map<std::string, nlohmann::json> checkpoints;
 };
 
-struct EngineCore : std::enable_shared_from_this<EngineCore> {
+struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
   BT::BehaviorTreeFactory factory;
   Scheduler scheduler;
   std::mutex mu;
   std::unordered_map<std::string, std::shared_ptr<TaskContext>> active;
   Engine::FinishedCallback on_finished;  // mu_ 保护
+  Engine::JournalSink journal_sink;      // mu_ 保护
   Engine::LogCallback log = [](LogLevel, const std::string& msg) {
     std::fprintf(stderr, "[nebulabt] %s\n", msg.c_str());
   };
@@ -69,6 +78,63 @@ struct EngineCore : std::enable_shared_from_this<EngineCore> {
   void logf(LogLevel lv, const std::string& msg) {
     std::lock_guard<std::mutex> lk(mu);
     if (log) log(lv, msg);
+  }
+
+  // ---- journal ----
+  void appendJournal(const std::shared_ptr<TaskContext>& ctx,
+                     const std::string& event, nlohmann::json data) {
+    JournalEvent e;
+    e.timestamp = nowTimestamp();
+    e.task_id = ctx->task_id;
+    e.task_type = ctx->task_type;
+    e.event = event;
+    e.data = std::move(data);
+    Engine::JournalSink sink;
+    {
+      std::lock_guard<std::mutex> lk(ctx->journal_mu);
+      if (ctx->journal.size() < TaskContext::kJournalMax) {
+        ctx->journal.push_back(e);
+      }
+      std::lock_guard<std::mutex> lk2(mu);
+      sink = journal_sink;
+    }
+    if (sink) {
+      sink(e);  // 锁外回调,避免死锁
+    }
+  }
+
+  // ---- ICheckpointHost ----
+  bool checkpointTryResume(const std::string& task_id,
+                           const std::string& cp_id,
+                           nlohmann::json* out_snapshot) override {
+    auto ctx = findTask(task_id);
+    if (!ctx) return false;
+    bool found = false;
+    {
+      std::lock_guard<std::mutex> lk(ctx->journal_mu);
+      auto it = ctx->checkpoints.find(cp_id);
+      if (it != ctx->checkpoints.end()) {
+        *out_snapshot = it->second;
+        found = true;
+      }
+    }
+    if (found) {
+      // 锁外记录事件(appendJournal 会再锁 journal_mu,不可重入)
+      appendJournal(ctx, "checkpoint_restored", nlohmann::json{{"id", cp_id}});
+    }
+    return found;
+  }
+
+  void checkpointRecord(const std::string& task_id, const std::string& cp_id,
+                        const nlohmann::json& snapshot) override {
+    auto ctx = findTask(task_id);
+    if (!ctx) return;
+    {
+      std::lock_guard<std::mutex> lk(ctx->journal_mu);
+      ctx->checkpoints[cp_id] = snapshot;
+    }
+    appendJournal(ctx, "checkpoint",
+                  nlohmann::json{{"id", cp_id}, {"blackboard", snapshot}});
   }
 
   std::shared_ptr<TaskContext> findTask(const std::string& id) {
@@ -87,7 +153,9 @@ struct EngineCore : std::enable_shared_from_this<EngineCore> {
     if (!ctx) return;
 
     TaskState expected = TaskState::Queued;
-    ctx->state.compare_exchange_strong(expected, TaskState::Running);
+    if (ctx->state.compare_exchange_strong(expected, TaskState::Running)) {
+      appendJournal(ctx, "started", nlohmann::json::object());
+    }
     if (ctx->state.load() != TaskState::Running) {
       return; // 已终态(如已取消)
     }
@@ -123,6 +191,9 @@ struct EngineCore : std::enable_shared_from_this<EngineCore> {
       std::lock_guard<std::mutex> lk(ctx->wait_mu);
     }
     ctx->wait_cv.notify_all();
+
+    appendJournal(ctx, "finished",
+                  nlohmann::json{{"state", toString(st)}, {"reason", reason}});
 
     logf(LogLevel::Info, "task " + ctx->task_id + " " + toString(st) +
                              (reason.empty() ? "" : " (" + reason + ")"));
@@ -508,6 +579,10 @@ Engine::Engine() : core_(std::make_shared<detail::EngineCore>()) {
         core->scheduler.post([core, taskId] { core->tickTask(taskId); });
       });
 
+  // Checkpoint 需要读写任务的检查点历史与 journal:注入宿主(EngineCore)
+  core_->factory.registerNodeType<CheckpointNode>("Checkpoint",
+                                                  core_.get());
+
   core_->scheduler.start();
 }
 
@@ -605,10 +680,34 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
   ctx->task_type = spec.task_type;
   ctx->tree = tree;
   {
+    // 断点恢复(M2):从上一轮 journal 提取已完成的检查点快照
+    std::lock_guard<std::mutex> lk(ctx->journal_mu);
+    if (spec.resume_journal.is_array()) {
+      for (const auto& e : spec.resume_journal) {
+        JournalEvent ev;
+        try {
+          ev = e.get<JournalEvent>();
+        } catch (const std::exception&) {
+          continue;
+        }
+        if (ev.event == "checkpoint" && ev.data.contains("id") &&
+            ev.data.contains("blackboard")) {
+          ctx->checkpoints[ev.data["id"].get<std::string>()] =
+              ev.data["blackboard"];
+        }
+      }
+    }
+  }
+  {
     std::lock_guard<std::mutex> lk(core_->mu);
     core_->active[spec.task_id] = ctx;
   }
   TaskHandle handle(ctx, core_);
+  core_->appendJournal(
+      ctx, "submitted", nlohmann::json{{"task_type", spec.task_type},
+                                       {"resumed",
+                                        spec.resume_journal.is_array() &&
+                                            !spec.resume_journal.empty()}});
   auto core = core_;
   auto id = spec.task_id;
   core_->scheduler.post([core, id] { core->tickTask(id); });
@@ -638,6 +737,11 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
 void Engine::onFinished(FinishedCallback cb) {
   std::lock_guard<std::mutex> lk(core_->mu);
   core_->on_finished = std::move(cb);
+}
+
+void Engine::setJournalSink(JournalSink cb) {
+  std::lock_guard<std::mutex> lk(core_->mu);
+  core_->journal_sink = std::move(cb);
 }
 
 void Engine::setLogger(LogCallback cb) {
@@ -691,6 +795,14 @@ std::vector<FailureRecord> TaskHandle::failures() const {
     return ctx_->failures->snapshot();
   }
   return {};
+}
+
+std::vector<JournalEvent> TaskHandle::journal() const {
+  if (!ctx_) {
+    return {};
+  }
+  std::lock_guard<std::mutex> lk(ctx_->journal_mu);
+  return ctx_->journal;
 }
 
 nlohmann::json TaskHandle::explain() const {
