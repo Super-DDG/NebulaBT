@@ -80,6 +80,14 @@ NebulaBT 是一个面向业务开发的行为树编排框架,目标行业:机器
 
 `ForEachNode`:遍历 `array`(黑板 `vector<string>` 或 `;` 分隔字符串),每轮将当前元素写入 `element` 输出端口,依次 tick 子节点。子节点 RUNNING → 整体 RUNNING(下轮续跑);FAILURE → 默认整体失败,`continue_on_failure="true"` 时跳过。
 
+**WhileLoop**:真正的 while 循环(condition + body,非 reactive)。语义:body RUNNING 期间不重估 condition;body SUCCESS → 重估 condition 决定继续/正常退出(SUCCESS);body FAILURE → 整体失败;condition FAILURE → 正常退出。与轮询式运行时的关键适配:body SUCCESS 后**同 tick 重估 condition** 并把子节点 reset 回 IDLE(轮询式实现靠外层下一 tick 推进,事件驱动模型没有下一 tick 就死等);`max_iterations`(默认 1000)防全同步死循环。
+
+**SwitchN**:可变 case 数的 Switch(`case_1..case_32`,default 恒为最后一个子节点)。BT.CPP 4.9 内置 Switch2~6 模板仍有 case 上限;SwitchN 语义与其一致(切换分支时 halt 上一个 RUNNING 子节点),去掉数量限制。
+
+> 实现教训(WhileLoop):BT.CPP 的 `StatefulActionNode` 处于终态时再次
+> `executeTick()` 会**直接返回缓存的终态**而不调 onStart——循环类控制节点
+> 在重入子节点前必须先 reset,否则静默空转。
+
 规划(M1+):运行时按数据实例化子节点、WhileUntil、ParallelMap。
 
 ### 4.4 任务生命周期(已实现,M0 基础版)

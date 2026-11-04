@@ -4,6 +4,8 @@
 #include "nebulabt/core/schema.hpp"
 #include "nebulabt/nodes/for_each.hpp"
 #include "nebulabt/nodes/retry_with_delay.hpp"
+#include "nebulabt/nodes/switch_n.hpp"
+#include "nebulabt/nodes/while_loop.hpp"
 
 #include <behaviortree_cpp/behavior_tree.h>
 #include <behaviortree_cpp/blackboard.h>
@@ -493,7 +495,10 @@ void NebulaCtx::fail(std::string code, std::string message) {
 // ============================================================================
 
 Engine::Engine() : core_(std::make_shared<detail::EngineCore>()) {
+  // 内置动态树原语与策略节点
   core_->factory.registerNodeType<ForEachNode>("ForEach");
+  core_->factory.registerNodeType<WhileLoopNode>("WhileLoop");
+  core_->factory.registerNodeType<SwitchNNode>("SwitchN");
 
   // RetryWithDelay 需要延时唤醒:注入调度器与任务唤醒函数
   auto core = core_;

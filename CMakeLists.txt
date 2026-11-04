@@ -50,7 +50,9 @@ add_library(nebulabt
   src/core/schema.cpp
   src/core/engine.cpp
   src/nodes/for_each.cpp
-  src/nodes/retry_with_delay.cpp)
+  src/nodes/retry_with_delay.cpp
+  src/nodes/switch_n.cpp
+  src/nodes/while_loop.cpp)
 add_library(nebulabt::nebulabt ALIAS nebulabt)
 
 target_include_directories(nebulabt PUBLIC

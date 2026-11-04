@@ -397,6 +397,117 @@ static void test_schema_typed_injection() {
   CHECK(task.wait() == TaskState::Succeeded);
 }
 
+static void test_while_loop() {
+  Engine engine;
+  engine.registerAction("Ok", std::make_shared<Ok>());
+  engine.registerAction("Boom", std::make_shared<Boom>());
+
+  // condition:前 3 次激活返回 SUCCESS,之后 FAILURE(模拟"还有活干?")
+  auto condCount = std::make_shared<std::atomic<int>>(0);
+  class Cond : public NebulaAction {
+  public:
+    std::shared_ptr<std::atomic<int>> n;
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx&, const Done&) override {
+      return n->fetch_add(1) < 3 ? NodeStatus::SUCCESS : NodeStatus::FAILURE;
+    }
+  };
+  auto cond = std::make_shared<Cond>();
+  cond->n = condCount;
+  engine.registerAction("Cond", cond);
+
+  // body:计数
+  auto bodyCount = std::make_shared<std::atomic<int>>(0);
+  class Body : public NebulaAction {
+  public:
+    std::shared_ptr<std::atomic<int>> n;
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx&, const Done&) override {
+      n->fetch_add(1);
+      return NodeStatus::SUCCESS;
+    }
+  };
+  auto body = std::make_shared<Body>();
+  body->n = bodyCount;
+  engine.registerAction("Body", body);
+
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <WhileLoop><Cond/><Body/></WhileLoop>
+    </BehaviorTree></root>)");
+  CHECK(task.wait() == TaskState::Succeeded);   // condition FAILURE = 正常退出
+  CHECK(bodyCount->load() == 3);                // body 恰好执行 3 次
+
+  // body FAILURE -> 整体 FAILED(重置 condition 计数,先让它 SUCCESS 一次)
+  condCount->store(0);
+  auto task2 = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <WhileLoop><Cond/><Boom/></WhileLoop>
+    </BehaviorTree></root>)");
+  CHECK(task2.wait() == TaskState::Failed);
+
+  // max_iterations 防失控:条件永真 + body 永成功,默认 1000 次后 FAILURE(而非挂死)
+  class Always : public NebulaAction {
+  public:
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx&, const Done&) override { return NodeStatus::SUCCESS; }
+  };
+  engine.registerAction("Always", std::make_shared<Always>());
+  const auto t0 = std::chrono::steady_clock::now();
+  auto task3 = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <WhileLoop><Always/><Always/></WhileLoop>
+    </BehaviorTree></root>)");
+  CHECK(task3.wait() == TaskState::Failed);     // 而不是永远 RUNNING
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+  CHECK(elapsedMs < 2000);
+}
+
+static void test_switch_n() {
+  Engine engine;
+  // 记录哪个分支执行了
+  auto hit = std::make_shared<std::string>();
+  class Branch : public NebulaAction {
+  public:
+    std::shared_ptr<std::string> hit;
+    std::string tag;
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx&, const Done&) override {
+      *hit = tag;
+      return NodeStatus::SUCCESS;
+    }
+  };
+  auto mk = [&](const std::string& tag) {
+    auto n = std::make_shared<Branch>();
+    n->hit = hit;
+    n->tag = tag;
+    engine.registerAction(tag, n);
+    return n;
+  };
+  mk("BranchA");
+  mk("BranchB");
+  mk("DefaultBranch");
+
+  const char* xml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <SwitchN variable="{mode}" case_1="a" case_2="b">
+        <BranchA/>
+        <BranchB/>
+        <DefaultBranch/>
+      </SwitchN>
+    </BehaviorTree></root>)";
+
+  TaskSpec spec;
+  spec.slots["mode"] = "b";
+  CHECK(engine.submitFromText(xml, spec).wait() == TaskState::Succeeded);
+  CHECK(*hit == "BranchB");
+
+  spec.slots["mode"] = "zz";  // 未命中 -> default
+  CHECK(engine.submitFromText(xml, spec).wait() == TaskState::Succeeded);
+  CHECK(*hit == "DefaultBranch");
+}
+
 static void test_retry_budget() {
   Engine engine;
   auto failer = std::make_shared<Failer>();
@@ -444,6 +555,10 @@ int main() {
   std::cout << "ok  schema typed injection\n";
   test_retry_budget();
   std::cout << "ok  retry wall-clock budget\n";
+  test_while_loop();
+  std::cout << "ok  while loop\n";
+  test_switch_n();
+  std::cout << "ok  switch n\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }
