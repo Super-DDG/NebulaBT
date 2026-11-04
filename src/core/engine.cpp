@@ -2,6 +2,7 @@
 
 #include "nebulabt/core/scheduler.hpp"
 #include "nebulabt/nodes/for_each.hpp"
+#include "nebulabt/nodes/retry_with_delay.hpp"
 
 #include <behaviortree_cpp/behavior_tree.h>
 #include <behaviortree_cpp/blackboard.h>
@@ -188,6 +189,8 @@ public:
 
   BT::NodeStatus onStart() override {
     initCtx();
+    failCountAtStart_ =
+        (ctx_ && ctx_->failures_) ? ctx_->failures_->size() : 0;
     BT::NodeStatus status = BT::NodeStatus::FAILURE;
     try {
       status = action_->start(*ctx_, makeDone());
@@ -198,6 +201,9 @@ public:
     if (status != BT::NodeStatus::RUNNING) {
       // 同步完成:以返回值为准,丢弃可能已写入的 pending
       clearPending();
+      if (status == BT::NodeStatus::FAILURE) {
+        maybeAutoRecordFailure();
+      }
     }
     return status;
   }
@@ -206,6 +212,9 @@ public:
     // done 已回调:应用结果并返回终态
     if (auto result = takePending()) {
       writeResultToOutputs(*this, action_->providedPorts(), result->result);
+      if (result->status == BT::NodeStatus::FAILURE) {
+        maybeAutoRecordFailure();
+      }
       return result->status;
     }
     // 等待 done 回调唤醒调度器
@@ -248,6 +257,19 @@ private:
     slot_->data.reset();
   }
 
+  /// 失败自动捕获:动作返回 FAILURE 却没有调用 ctx.fail() 时,
+  /// 框架兜底记录一条 NODE_FAILURE(失败必须可解释,不依赖作者自觉)
+  void maybeAutoRecordFailure() {
+    if (!ctx_) {
+      return;
+    }
+    if (ctx_->failures_ && ctx_->failures_->size() != failCountAtStart_) {
+      return; // 作者已显式记录
+    }
+    ctx_->fail("NODE_FAILURE",
+               "action returned FAILURE without ctx.fail()");
+  }
+
   void initCtx() {
     std::string taskId = "unknown";
     std::string taskType;
@@ -286,6 +308,7 @@ private:
   std::shared_ptr<Slot> slot_;
   std::unique_ptr<NebulaCtx> ctx_;
   std::string task_id_;
+  size_t failCountAtStart_ = 0;
 };
 
 // explain() 的树遍历:节点路径 + 当前状态
@@ -372,6 +395,15 @@ void NebulaCtx::fail(std::string code, std::string message) {
 
 Engine::Engine() : core_(std::make_shared<detail::EngineCore>()) {
   core_->factory.registerNodeType<ForEachNode>("ForEach");
+
+  // RetryWithDelay 需要延时唤醒:注入调度器与任务唤醒函数
+  auto core = core_;
+  core_->factory.registerNodeType<RetryWithDelayNode>(
+      "RetryWithDelay", &core_->scheduler,
+      [core](const std::string& taskId) {
+        core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+      });
+
   core_->scheduler.start();
 }
 
@@ -434,6 +466,26 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
   auto core = core_;
   auto id = spec.task_id;
   core_->scheduler.post([core, id] { core->tickTask(id); });
+
+  // 策略:任务级超时(调度线程回调;到点未终态则 halt + TASK_TIMEOUT)
+  if (spec.timeout_ms > 0) {
+    const uint64_t timeoutMs = spec.timeout_ms;
+    core_->scheduler.callLater(std::chrono::milliseconds(timeoutMs),
+                               [core, ctx, timeoutMs] {
+      if (ctx->finished.load()) {
+        return;
+      }
+      FailureRecord fr;
+      fr.code = "TASK_TIMEOUT";
+      fr.node = "engine";
+      fr.node_type = "Engine";
+      fr.message = "task exceeded " + std::to_string(timeoutMs) + " ms";
+      fr.timestamp = nowTimestamp();
+      ctx->failures->add(std::move(fr));
+      ctx->tree->haltTree();
+      core->finishTask(ctx, TaskState::Failed, "task timeout");
+    });
+  }
   return handle;
 }
 

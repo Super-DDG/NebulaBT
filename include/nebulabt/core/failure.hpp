@@ -29,6 +29,7 @@ public:
   void add(FailureRecord record);
   std::vector<FailureRecord> snapshot() const;
   bool empty() const;
+  size_t size() const;
 
 private:
   mutable std::mutex mu_;

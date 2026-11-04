@@ -47,7 +47,8 @@ add_library(nebulabt
   src/core/failure.cpp
   src/core/scheduler.cpp
   src/core/engine.cpp
-  src/nodes/for_each.cpp)
+  src/nodes/for_each.cpp
+  src/nodes/retry_with_delay.cpp)
 add_library(nebulabt::nebulabt ALIAS nebulabt)
 
 target_include_directories(nebulabt PUBLIC
@@ -59,6 +60,7 @@ target_link_libraries(nebulabt PUBLIC ${NEBULABT_BT_CPP_TARGET})
 
 if(NEBULABT_BUILD_EXAMPLES)
   add_subdirectory(examples/hello_tree)
+  add_subdirectory(examples/robot_delivery)
 endif()
 
 if(NEBULABT_BUILD_TESTS)

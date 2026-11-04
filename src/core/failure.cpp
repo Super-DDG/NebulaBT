@@ -40,6 +40,11 @@ bool FailureLog::empty() const {
   return records_.empty();
 }
 
+size_t FailureLog::size() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return records_.size();
+}
+
 std::string nowTimestamp() {
   using namespace std::chrono;
   const auto now = system_clock::now();

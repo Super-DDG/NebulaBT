@@ -226,6 +226,49 @@ static void test_on_finished_callback() {
   CHECK(got.load());
 }
 
+static void test_timeout_policy() {
+  Engine engine;
+  auto forever = std::make_shared<Forever>();
+  engine.registerAction("Forever", forever);
+
+  TaskSpec spec;
+  spec.timeout_ms = 80;
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Forever/>
+    </BehaviorTree></root>)", spec);
+
+  CHECK(task.wait() == TaskState::Failed);
+  CHECK(forever->halted.load());          // 超时触发 halt 传播
+  auto failures = task.failures();
+  CHECK(failures.size() == 1);
+  CHECK(failures[0].code == "TASK_TIMEOUT");
+}
+
+static void test_auto_failure_capture() {
+  Engine engine;
+  // 静默失败:返回 FAILURE 但不调 ctx.fail —— 框架兜底记录
+  class SilentFail : public NebulaAction {
+  public:
+    BT::PortsList providedPorts() const override { return {}; }
+    BT::NodeStatus start(NebulaCtx&, const Done&) override {
+      return BT::NodeStatus::FAILURE;
+    }
+  };
+  engine.registerAction("SilentFail", std::make_shared<SilentFail>());
+
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <SilentFail/>
+    </BehaviorTree></root>)");
+  CHECK(task.wait() == TaskState::Failed);
+
+  auto failures = task.failures();
+  CHECK(failures.size() == 1);
+  CHECK(failures[0].code == "NODE_FAILURE");
+  CHECK(failures[0].node == "SilentFail");
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -239,6 +282,10 @@ int main() {
   std::cout << "ok  scheduler timer\n";
   test_on_finished_callback();
   std::cout << "ok  on finished callback\n";
+  test_timeout_policy();
+  std::cout << "ok  timeout policy\n";
+  test_auto_failure_capture();
+  std::cout << "ok  auto failure capture\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

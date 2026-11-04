@@ -29,6 +29,9 @@ struct TaskSpec {
   ///   array  -> 黑板 vector<string>(ForEach 直接可用)
   ///   其它   -> dump() 为 string
   nlohmann::json slots = nlohmann::json::object();
+  /// 任务级超时(毫秒,0 = 不限制)。超时触发:halt 整棵树 +
+  /// 记录 TASK_TIMEOUT 失败 + 终态 FAILED(策略引擎 M1 的第一块)
+  uint64_t timeout_ms = 0;
 };
 
 /// 任务句柄

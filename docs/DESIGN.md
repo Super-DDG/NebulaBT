@@ -62,19 +62,21 @@ NebulaBT 是一个面向业务开发的行为树编排框架,目标行业:机器
 
 业务节点的异步由回调续传表达(见 ADR-002):`start()` 发起调用返回 RUNNING,完成时在**任意线程**调用 `done(status, result)`,调度器被唤醒、树继续推进。
 
-### 4.2 结构化失败(已实现,M0 基础版)
+### 4.2 结构化失败(已实现)
 
 失败是数据,不是日志行。约定:
 
 - 节点内 `ctx.fail(code, message)` 记录,自动附带节点名/注册名/时间戳
+- **失败自动捕获**:动作返回 FAILURE 却没调用 `ctx.fail()` 时,框架兜底记录
+  `NODE_FAILURE`——失败可解释不依赖作者自觉
 - 任务终态可查询:`task.failures()` 返回结构化记录数组
 - `task.explain()` 返回完整执行报告:树形结构 + 各节点状态 + 失败记录
 
-规划(M1+):框架在节点返回 FAILURE 时自动捕获(不依赖作者自觉);策略层填充 attempt 重试计数。
+规划:策略层填充 attempt 重试计数;失败码登记表。
 
 ### 4.3 动态树原语(已实现:ForEach)
 
-行为树的 XML 是静态的,"对购物车每个商品做校验"这类按数据集合展开的逻辑,一直是 BT 进入业务领域的最大阻力——静态树的解法只有复制粘贴(一个真实机器人项目里,同一段"导航+检测"子树被复制了 4 份)。
+行为树的 XML 是静态的,"对购物车每个商品做校验"这类按数据集合展开的逻辑,一直是 BT 进入业务领域的最大阻力——静态树的解法只有复制粘贴,同一段"导航+检测"子树按地点复制多份是真实项目中的常见反模式。
 
 `ForEachNode`:遍历 `array`(黑板 `vector<string>` 或 `;` 分隔字符串),每轮将当前元素写入 `element` 输出端口,依次 tick 子节点。子节点 RUNNING → 整体 RUNNING(下轮续跑);FAILURE → 默认整体失败,`continue_on_failure="true"` 时跳过。
 
@@ -94,9 +96,16 @@ QUEUED → RUNNING → SUCCEEDED / FAILED / CANCELED
 
 加载期三层校验:树内端口类型(BT.CPP 已有)、树 ↔ task schema 交叉校验、schema ↔ 提交 slots 校验。目标:**错误在加载期爆,不在深夜爆**。
 
-### 4.6 策略引擎(M1)
+### 4.6 策略引擎(M1 进行中)
 
-超时、重试预算(次数 + 墙钟双限制)、取消级联——由框架在树加载后自动包裹,不靠树作者自觉。
+已实现:
+
+- **任务级超时**:`TaskSpec.timeout_ms`,到点未终态则 halt 整棵树 + 记录
+  `TASK_TIMEOUT` + 终态 FAILED
+- **RetryWithDelay 装饰器**:BT.CPP 4.9 内置重试无尝试间延时;NebulaBT 提供
+  带延时的版本,延时到期经调度器唤醒,无轮询
+
+规划:重试墙钟预算(次数 + 时间双限制)、抢占规则、由框架自动包裹(作者忘不掉的保险)。
 
 ### 4.7 持久化与恢复(M2)
 
@@ -116,18 +125,18 @@ BT.CPP 无法快照"哪个节点正在 RUNNING"(那是 C++ 调用栈状态)。�
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M0(当前)** | 核心骨架:调度器 / SDK / Bridge / ForEach / 失败记录 / explain / 取消 | hello_tree 跑通;单测覆盖同步/异步/遍历/取消/定时器 |
-| M1 | 类型化 schema 校验;策略包裹(超时/重试预算);失败自动捕获;`nebula validate` CLI | 迁移一个真实机器人业务树,零复制 + 参数化 |
+| **M0 ✅** | 核心骨架:调度器 / SDK / Bridge / ForEach / 失败记录 / explain / 取消 | hello_tree 跑通;单测覆盖同步/异步/遍历/取消/定时器 |
+| **M1(进行中)** | 类型化 schema 校验;策略(超时 ✅ / 重试预算);失败自动捕获 ✅;RetryWithDelay ✅;`nebula validate` CLI | **试金石已通过**:`examples/robot_delivery` 演示典型"拣选-递送"业务迁移,搜寻段 4 份复制 → 1 份数据驱动 |
 | M2 | journal + checkpoint 恢复;explain 完整版(耗时/尝试次数);journal 回放回归 | kill -9 后断点续跑演示 |
 | M3 | 树包版本化与灰度路由;Mock 自动生成;自动流程文档 | 1.0 发布 |
 
-## 6. M0 已知限制
+## 6. 已知限制
 
 - explain 中节点状态为终态后会被 BT.CPP 重置为 IDLE,报告反映的是重置后状态(非运行中快照)
 - slots 类型仅支持 string / array→vector<string> / 其它 dump 为 string;完整类型系统在 M1
 - Engine 析构时未完成任务直接终止(halt 不会被调用),析构前应确保任务完成或取消
 - `ForEachNode` 仅支持 string 集合;结构化元素在 M1 类型系统中解决
-- 无策略包裹:超时/重试预算需要树内显式使用 BT.CPP 的 Timeout/Retry 装饰器
+- 重试仅次数预算,墙钟时间预算未实现
 
 ## 7. 决策记录
 
