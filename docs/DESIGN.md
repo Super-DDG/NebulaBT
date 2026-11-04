@@ -92,20 +92,32 @@ QUEUED → RUNNING → SUCCEEDED / FAILED / CANCELED
 - 取消:`cancel()` → halt 整棵树 → 各动作 `halt()` 回调 → CANCELED
 - 终态回调:`Engine::onFinished`(调度线程执行)
 
-### 4.5 类型化黑板与校验(M1)
+### 4.5 类型化黑板与校验(已实现,M1)
 
-加载期三层校验:树内端口类型(BT.CPP 已有)、树 ↔ task schema 交叉校验、schema ↔ 提交 slots 校验。目标:**错误在加载期爆,不在深夜爆**。
+加载期校验,目标:**错误在加载期爆,不在深夜爆**。
 
-### 4.6 策略引擎(M1 进行中)
+- **L1 提交 ↔ schema**:required 缺失 / 未知字段(防拼写错)/ 类型不符,
+  提交时拒绝;schema 声明的 int/double/bool 按**真实类型**注入黑板
+- **L2 树 ↔ schema(端口级数据流检查)**:树中端口引用的每个黑板键,
+  必须是 schema 声明键、框架注入键(task_id/task_type)或树内某节点
+  Output 写出的键——键名拼写错误、"注入了但没人读"在加载期暴露
+- schema 未提供 = 关闭校验,完全向后兼容
+- `nebula validate <tree.xml> [schema.json]` CLI:CI 门禁
+- 树内端口类型检查由 BT.CPP 加载期完成(免费)
 
-已实现:
+已知边界(L2 v0):Script/ScriptCondition 代码串中引用的键暂不检查;
+后续随树包(M3)补齐。
+
+### 4.6 策略引擎(已实现,M1)
 
 - **任务级超时**:`TaskSpec.timeout_ms`,到点未终态则 halt 整棵树 + 记录
   `TASK_TIMEOUT` + 终态 FAILED
 - **RetryWithDelay 装饰器**:BT.CPP 4.9 内置重试无尝试间延时;NebulaBT 提供
   带延时的版本,延时到期经调度器唤醒,无轮询
+- **重试墙钟预算**:`budget_ms` 端口,次数与时间任一用尽即失败
+  ——防"30 次重试跑几十分钟"
 
-规划:重试墙钟预算(次数 + 时间双限制)、抢占规则、由框架自动包裹(作者忘不掉的保险)。
+规划:抢占规则;由框架自动包裹(作者忘不掉的保险)。
 
 ### 4.7 持久化与恢复(M2)
 
@@ -126,17 +138,18 @@ BT.CPP 无法快照"哪个节点正在 RUNNING"(那是 C++ 调用栈状态)。�
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0 ✅** | 核心骨架:调度器 / SDK / Bridge / ForEach / 失败记录 / explain / 取消 | hello_tree 跑通;单测覆盖同步/异步/遍历/取消/定时器 |
-| **M1(进行中)** | 类型化 schema 校验;策略(超时 ✅ / 重试预算);失败自动捕获 ✅;RetryWithDelay ✅;`nebula validate` CLI | **试金石已通过**:`examples/robot_delivery` 演示典型"拣选-递送"业务迁移,搜寻段 4 份复制 → 1 份数据驱动 |
+| **M1 ✅** | 类型化 schema 校验(L1+L2)✅;策略(超时 ✅ / RetryWithDelay ✅ / 墙钟预算 ✅);失败自动捕获 ✅;`nebula validate` CLI ✅ | **试金石通过**:`examples/robot_delivery` 演示典型"拣选-递送"业务,搜寻段 N 份复制 → 1 份数据驱动,全树在 schema 严格模式下自洽 |
 | M2 | journal + checkpoint 恢复;explain 完整版(耗时/尝试次数);journal 回放回归 | kill -9 后断点续跑演示 |
 | M3 | 树包版本化与灰度路由;Mock 自动生成;自动流程文档 | 1.0 发布 |
 
 ## 6. 已知限制
 
 - explain 中节点状态为终态后会被 BT.CPP 重置为 IDLE,报告反映的是重置后状态(非运行中快照)
-- slots 类型仅支持 string / array→vector<string> / 其它 dump 为 string;完整类型系统在 M1
+- 未提供 schema 时,slots 注入规则为 string / array→vector<string> / 其它 dump;
+  提供后标量类型按真实类型注入
+- L2 数据流检查不覆盖 Script/ScriptCondition 代码串中引用的键
 - Engine 析构时未完成任务直接终止(halt 不会被调用),析构前应确保任务完成或取消
-- `ForEachNode` 仅支持 string 集合;结构化元素在 M1 类型系统中解决
-- 重试仅次数预算,墙钟时间预算未实现
+- `ForEachNode` 仅支持 string 集合;结构化元素待后续类型系统
 
 ## 7. 决策记录
 

@@ -1,6 +1,7 @@
 #include "nebulabt/core/engine.hpp"
 
 #include "nebulabt/core/scheduler.hpp"
+#include "nebulabt/core/schema.hpp"
 #include "nebulabt/nodes/for_each.hpp"
 #include "nebulabt/nodes/retry_with_delay.hpp"
 
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -335,12 +337,109 @@ static nlohmann::json walkNode(const BT::TreeNode* node, const std::string& path
   return j;
 }
 
-static void injectSlots(BT::Tree& tree, const TaskSpec& spec) {
+// ============================================================================
+// L2 校验:树 ↔ schema 的端口级数据流检查
+//
+// 收集树中所有端口引用的黑板键({key} 形式),要求每个"被读"的键属于:
+//   schema 声明 / 框架注入(task_id, task_type)/ 树内某节点 Output 写出
+// 目标:键名拼写错误、忘记声明 slots 这类问题在加载期暴露,
+// 而不是运行时表现为"注入了但没人读"的空串。
+// ============================================================================
+
+struct KeyRef {
+  std::string key;
+  std::string node;
+  std::string port;
+  bool is_write;
+};
+
+static bool parseKeyRef(const std::string& remap, std::string* keyOut) {
+  if (remap.size() < 3 || remap.front() != '{' || remap.back() != '}') {
+    return false;
+  }
+  std::string key = remap.substr(1, remap.size() - 2);
+  // 去空白
+  const auto first = key.find_first_not_of(" \t");
+  const auto last = key.find_last_not_of(" \t");
+  if (first == std::string::npos) {
+    return false;
+  }
+  *keyOut = key.substr(first, last - first + 1);
+  return !keyOut->empty();
+}
+
+static void collectKeyRefs(const BT::TreeNode* node, std::vector<KeyRef>& refs) {
+  for (const auto& [port, remap] : node->config().input_ports) {
+    std::string key;
+    if (parseKeyRef(remap, &key)) {
+      refs.push_back(KeyRef{key, node->name(), port, false});
+    }
+  }
+  for (const auto& [port, remap] : node->config().output_ports) {
+    std::string key;
+    if (parseKeyRef(remap, &key)) {
+      refs.push_back(KeyRef{key, node->name(), port, true});
+    }
+  }
+  if (auto ctrl = dynamic_cast<const BT::ControlNode*>(node)) {
+    for (const BT::TreeNode* child : ctrl->children()) {
+      collectKeyRefs(child, refs);
+    }
+  } else if (auto dec = dynamic_cast<const BT::DecoratorNode*>(node)) {
+    if (dec->child()) {
+      collectKeyRefs(dec->child(), refs);
+    }
+  }
+}
+
+static void validateTreeKeys(const BT::Tree& tree,
+                             const std::map<std::string, SlotDef>& defs,
+                             std::vector<std::string>& errors) {
+  std::vector<KeyRef> refs;
+  collectKeyRefs(tree.rootNode(), refs);
+
+  std::set<std::string> produced{"task_id", "task_type"};  // 框架注入
+  for (const auto& [key, def] : defs) {
+    produced.insert(key);
+  }
+  for (const auto& ref : refs) {
+    if (ref.is_write) {
+      produced.insert(ref.key);
+    }
+  }
+  for (const auto& ref : refs) {
+    if (!ref.is_write && !produced.count(ref.key)) {
+      errors.push_back("node '" + ref.node + "' port '" + ref.port +
+                       "' reads undeclared blackboard key '" + ref.key +
+                       "' (not in schema and never written by the tree)");
+    }
+  }
+}
+
+static void injectSlots(BT::Tree& tree, const TaskSpec& spec,
+                        const std::map<std::string, SlotDef>& defs) {
   auto bb = tree.rootBlackboard();
   bb->set("task_id", spec.task_id);
   bb->set("task_type", spec.task_type);
   for (auto it = spec.slots.begin(); it != spec.slots.end(); ++it) {
     const auto& v = it.value();
+    // schema 声明的标量类型按真实类型注入(类型已在 L1 校验通过)
+    auto defIt = defs.find(it.key());
+    if (defIt != defs.end()) {
+      const auto& type = defIt->second.type;
+      if (type == "int" && v.is_number_integer()) {
+        bb->set(it.key(), v.get<int>());
+        continue;
+      }
+      if (type == "double" && v.is_number()) {
+        bb->set(it.key(), v.get<double>());
+        continue;
+      }
+      if (type == "bool" && v.is_boolean()) {
+        bb->set(it.key(), v.get<bool>());
+        continue;
+      }
+    }
     if (v.is_string()) {
       bb->set(it.key(), v.get<std::string>());
     } else if (v.is_array()) {
@@ -434,6 +533,9 @@ TaskHandle Engine::submitFromText(const std::string& xmlText, TaskSpec spec) {
     core_->logf(LogLevel::Error, "create tree failed: " + std::string(e.what()));
     return TaskHandle();
   }
+  if (!validateTask(*tree, spec)) {
+    return TaskHandle();
+  }
   return submitTree(std::move(tree), std::move(spec));
 }
 
@@ -449,11 +551,50 @@ TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec) {
     core_->logf(LogLevel::Error, "create tree failed: " + std::string(e.what()));
     return TaskHandle();
   }
+  if (!validateTask(*tree, spec)) {
+    return TaskHandle();
+  }
   return submitTree(std::move(tree), std::move(spec));
 }
 
+bool Engine::validateTask(BT::Tree& tree, const TaskSpec& spec) const {
+  std::vector<std::string> errors;
+  const auto defs = parseSlotSchema(spec.schema, errors);
+  auto slotErrors = validateSlotsAgainstSchema(defs, spec.slots);
+  errors.insert(errors.end(), slotErrors.begin(), slotErrors.end());
+  if (!defs.empty()) {
+    // schema 未启用时跳过 L2 数据流检查(向后兼容既有任务)
+    detail::validateTreeKeys(tree, defs, errors);
+  }
+  if (errors.empty()) {
+    return true;
+  }
+  for (const auto& e : errors) {
+    core_->logf(LogLevel::Error, "validation: " + e);
+  }
+  return false;
+}
+
+std::vector<std::string> Engine::validate(const std::string& xmlText,
+                                          const nlohmann::json& schema) {
+  std::vector<std::string> errors;
+  std::shared_ptr<BT::Tree> tree;
+  try {
+    tree = std::make_shared<BT::Tree>(
+        core_->factory.createTreeFromText(xmlText));
+  } catch (const std::exception& e) {
+    errors.push_back(std::string("parse error: ") + e.what());
+    return errors;
+  }
+  const auto defs = parseSlotSchema(schema, errors);
+  detail::validateTreeKeys(*tree, defs, errors);
+  return errors;
+}
+
 TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
-  detail::injectSlots(*tree, spec);
+  std::vector<std::string> parseErrors;  // schema 格式问题已在 validateTask 上报
+  const auto defs = parseSlotSchema(spec.schema, parseErrors);
+  detail::injectSlots(*tree, spec, defs);
   auto ctx = std::make_shared<detail::TaskContext>();
   ctx->task_id = spec.task_id;
   ctx->task_type = spec.task_type;

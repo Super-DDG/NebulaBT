@@ -42,6 +42,11 @@ public:
   TaskHandle submitFromText(const std::string& xmlText, TaskSpec spec = {});
   TaskHandle submitFromFile(const std::string& xmlPath, TaskSpec spec = {});
 
+  /// 加载期校验(不提交任务):解析树 + 按 schema 做 L2 树↔schema
+  /// 数据流检查。返回错误列表(空 = 通过)。`nebula validate` CLI 的后端。
+  std::vector<std::string> validate(const std::string& xmlText,
+                                    const nlohmann::json& schema = {});
+
   void onFinished(FinishedCallback cb);
 
   /// 日志回调(默认输出到 stderr)
@@ -49,6 +54,7 @@ public:
 
 private:
   TaskHandle submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec);
+  bool validateTask(BT::Tree& tree, const TaskSpec& spec) const;
 
   std::shared_ptr<detail::EngineCore> core_;
 };

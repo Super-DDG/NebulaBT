@@ -25,10 +25,15 @@ struct TaskSpec {
   std::string task_id;    // 留空则自动生成
   std::string task_type;  // 注入黑板 task_type
   /// slots 注入黑板规则:
+  ///   schema 声明为 int/double/bool 且类型匹配 -> 按真实类型注入
   ///   string -> 黑板 string
   ///   array  -> 黑板 vector<string>(ForEach 直接可用)
   ///   其它   -> dump() 为 string
   nlohmann::json slots = nlohmann::json::object();
+  /// 任务 slots schema(可选;格式见 core/schema.hpp)。
+  /// 提供后启用加载期严格校验:L1 提交↔schema + L2 树↔schema 数据流检查;
+  /// 不提供 = 关闭校验,完全向后兼容。
+  nlohmann::json schema = nlohmann::json::object();
   /// 任务级超时(毫秒,0 = 不限制)。超时触发:halt 整棵树 +
   /// 记录 TASK_TIMEOUT 失败 + 终态 FAILED(策略引擎 M1 的第一块)
   uint64_t timeout_ms = 0;

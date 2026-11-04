@@ -307,6 +307,17 @@ static TaskState runDelivery(Engine& engine, MockWorld& world,
   TaskSpec spec;
   spec.task_type = "DELIVER_ORDER";
   spec.timeout_ms = 60000;  // 任务级超时兜底(策略引擎)
+
+  // schema(M1):加载期校验 —— required 缺失 / 未知字段 / 类型不符
+  // / 树中引用未声明键,全部在提交时拒绝;int 类型按真实类型注入黑板
+  spec.schema = {
+    { "slots", {
+        { "target_item",     { { "type", "string" }, { "required", true } } },
+        { "target_location", { { "type", "string" }, { "required", false } } },
+        { "grasp_retry",     { { "type", "int" },    { "required", false } } },
+    } }
+  };
+
   spec.slots["target_item"] = item;
   spec.slots["target_location"] = location;
   spec.slots["grasp_retry"] = graspRetry;

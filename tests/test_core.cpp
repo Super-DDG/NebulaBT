@@ -65,6 +65,17 @@ public:
   void halt(NebulaCtx&) override { halted.store(true); }
 };
 
+// 每次执行计数,始终失败
+class Failer : public NebulaAction {
+public:
+  std::atomic<int> calls{0};
+  BT::PortsList providedPorts() const override { return {}; }
+  NodeStatus start(NebulaCtx&, const Done&) override {
+    calls.fetch_add(1);
+    return NodeStatus::FAILURE;
+  }
+};
+
 // 记录被遍历到的元素
 class Collect : public NebulaAction {
 public:
@@ -269,6 +280,145 @@ static void test_auto_failure_capture() {
   CHECK(failures[0].node == "SilentFail");
 }
 
+// 写/读黑板键的测试节点
+class Writer : public NebulaAction {
+public:
+  BT::PortsList providedPorts() const override {
+    return { BT::OutputPort<std::string>("value") };
+  }
+  BT::NodeStatus start(NebulaCtx& ctx, const Done&) override {
+    ctx.out("value", std::string("hello"));
+    return BT::NodeStatus::SUCCESS;
+  }
+};
+
+class Reader : public NebulaAction {
+public:
+  BT::PortsList providedPorts() const override {
+    return { BT::InputPort<std::string>("value") };
+  }
+  BT::NodeStatus start(NebulaCtx&, const Done&) override {
+    return BT::NodeStatus::SUCCESS;
+  }
+};
+
+class ReadInt : public NebulaAction {
+public:
+  BT::PortsList providedPorts() const override {
+    return { BT::InputPort<int>("n") };
+  }
+  BT::NodeStatus start(NebulaCtx& ctx, const Done&) override {
+    return ctx.in<int>("n", -1) == 7 ? BT::NodeStatus::SUCCESS
+                                     : BT::NodeStatus::FAILURE;
+  }
+};
+
+static void test_schema_submission_validation() {
+  Engine engine;
+  engine.registerAction("Ok", std::make_shared<Ok>());
+  const char* xml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t"><Ok/></BehaviorTree></root>)";
+
+  nlohmann::json schema = {
+    { "slots", {
+        { "must_have", { { "type", "string" }, { "required", true } } },
+        { "opt_int",   { { "type", "int" },    { "required", false } } },
+    } }
+  };
+
+  TaskSpec spec;
+  spec.schema = schema;
+
+  // 缺 required 字段
+  spec.slots = { { "opt_int", 5 } };
+  CHECK(engine.submitFromText(xml, spec).empty());
+
+  // 未知字段(拼写错误在加载期暴露)
+  spec.slots = { { "must_have", "x" }, { "typo_key", "y" } };
+  CHECK(engine.submitFromText(xml, spec).empty());
+
+  // 类型不符
+  spec.slots = { { "must_have", "x" }, { "opt_int", "not_int" } };
+  CHECK(engine.submitFromText(xml, spec).empty());
+
+  // 合法提交通过
+  spec.slots = { { "must_have", "x" }, { "opt_int", 7 } };
+  auto task = engine.submitFromText(xml, spec);
+  CHECK(!task.empty());
+  CHECK(task.wait() == TaskState::Succeeded);
+
+  // 无 schema:完全向后兼容(未知字段不报错)
+  TaskSpec legacy;
+  legacy.slots = { { "anything", 1 } };
+  auto legacyTask = engine.submitFromText(xml, legacy);
+  CHECK(!legacyTask.empty());
+  legacyTask.wait();
+}
+
+static void test_schema_tree_key_validation() {
+  Engine engine;
+  engine.registerAction("Writer", std::make_shared<Writer>());
+  engine.registerAction("Reader", std::make_shared<Reader>());
+
+  // 合法:被读的键由树内 Output 写出
+  auto ok = engine.validate(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Sequence>
+        <Writer value="{k}"/>
+        <Reader value="{k}"/>
+      </Sequence>
+    </BehaviorTree></root>)");
+  CHECK(ok.empty());
+
+  // 非法:读了既未声明也未写出的键
+  auto bad = engine.validate(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Reader value="{never_written}"/>
+    </BehaviorTree></root>)");
+  CHECK(bad.size() == 1);
+  CHECK(bad[0].find("never_written") != std::string::npos);
+}
+
+static void test_schema_typed_injection() {
+  Engine engine;
+  engine.registerAction("ReadInt", std::make_shared<ReadInt>());
+
+  nlohmann::json schema = {
+    { "slots", { { "n", { { "type", "int" }, { "required", true } } } } }
+  };
+  TaskSpec spec;
+  spec.schema = schema;
+  spec.slots = { { "n", 7 } };  // schema 声明 int -> 黑板真实 int
+
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <ReadInt n="{n}"/>
+    </BehaviorTree></root>)", spec);
+  CHECK(task.wait() == TaskState::Succeeded);
+}
+
+static void test_retry_budget() {
+  Engine engine;
+  auto failer = std::make_shared<Failer>();
+  engine.registerAction("Failer", failer);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <RetryWithDelay attempts="100" delay_ms="20" budget_ms="80">
+        <Failer/>
+      </RetryWithDelay>
+    </BehaviorTree></root>)");
+  CHECK(task.wait() == TaskState::Failed);
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+
+  // 墙钟预算(80ms)先于次数(100)耗尽:远小于 100 次执行
+  CHECK(failer->calls.load() >= 2);
+  CHECK(failer->calls.load() <= 10);
+  CHECK(elapsedMs < 2000);
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -286,6 +436,14 @@ int main() {
   std::cout << "ok  timeout policy\n";
   test_auto_failure_capture();
   std::cout << "ok  auto failure capture\n";
+  test_schema_submission_validation();
+  std::cout << "ok  schema submission validation\n";
+  test_schema_tree_key_validation();
+  std::cout << "ok  schema tree key validation\n";
+  test_schema_typed_injection();
+  std::cout << "ok  schema typed injection\n";
+  test_retry_budget();
+  std::cout << "ok  retry wall-clock budget\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

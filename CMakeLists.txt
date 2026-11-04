@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(NEBULABT_BUILD_EXAMPLES "Build NebulaBT examples" ON)
 option(NEBULABT_BUILD_TESTS "Build NebulaBT tests" ON)
+option(NEBULABT_BUILD_TOOLS "Build the nebula CLI" ON)
 
 # BehaviorTree.CPP: system package first, then local source, then git fetch.
 set(NEBULABT_BT_CPP_SOURCE_DIR "" CACHE PATH
@@ -46,6 +47,7 @@ endif()
 add_library(nebulabt
   src/core/failure.cpp
   src/core/scheduler.cpp
+  src/core/schema.cpp
   src/core/engine.cpp
   src/nodes/for_each.cpp
   src/nodes/retry_with_delay.cpp)
@@ -66,4 +68,8 @@ endif()
 if(NEBULABT_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(NEBULABT_BUILD_TOOLS)
+  add_subdirectory(tools)
 endif()

@@ -11,6 +11,7 @@
 /// - 与 BT.CPP Timeout/装饰器自由组合
 
 #include <behaviortree_cpp/decorator_node.h>
+#include <chrono>
 #include <functional>
 #include <string>
 
@@ -37,6 +38,7 @@ private:
   Scheduler* scheduler_;
   WakeFn wake_;
   int attempts_left_ = 0;
+  std::chrono::steady_clock::time_point budget_start_;
 };
 
 } // namespace nebulabt
