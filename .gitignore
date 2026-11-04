@@ -1,0 +1,9 @@
+build/
+out/
+install/
+_deps/
+*.log
+compile_commands.json
+.vscode/
+.idea/
+.cache/
