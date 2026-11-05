@@ -9,6 +9,23 @@ namespace detail {
 
 namespace {
 
+// result 中的保留键 __fail_code/__fail_message → 结构化失败(M8):
+// done 回调在任意线程执行时无法安全访问 ctx;携带保留键即可让桥在
+// 调度线程内代记失败——异步包装器(如 LlmDecision)的校验逻辑
+// 只依赖捕获副本,零 ctx 访问,天然线程安全
+void extractFailKeys(NebulaCtx& ctx, nlohmann::json* result) {
+  if (result == nullptr || !result->is_object()) {
+    return;
+  }
+  auto it = result->find("__fail_code");
+  if (it != result->end() && it->is_string()) {
+    ctx.fail(it->get<std::string>(),
+             result->value("__fail_message", std::string()));
+    result->erase("__fail_code");
+    result->erase("__fail_message");
+  }
+}
+
 // result(json)中的键按端口类型写回 Output 端口
 void writeResultToOutputs(BT::TreeNode& node, const BT::PortsList& ports,
                           const nlohmann::json& result) {
@@ -87,8 +104,10 @@ BT::NodeStatus BridgeNode::onStart() {
 BT::NodeStatus BridgeNode::onRunning() {
   // done 已回调:应用结果并返回终态
   if (auto result = takePending()) {
+    extractFailKeys(*ctx_, &result->result);
     writeResultToOutputs(*this, action_->providedPorts(), result->result);
     if (result->status == BT::NodeStatus::FAILURE) {
+      // __fail_code 已记录失败:size 变化,此处自动跳过兜底记录
       maybeAutoRecordFailure();
     }
     return result->status;
@@ -161,7 +180,8 @@ void BridgeNode::initCtx() {
   // 直接 new(NebulaCtx 构造私有,friend 本类;make_unique 的实例化
   // 上下文不继承 friend 权限,不能用于私有构造)
   ctx_.reset(new NebulaCtx(*this, core_->findFailures(taskId),
-                           std::move(taskId), std::move(taskType)));
+                           std::move(taskId), std::move(taskType),
+                           core_->failure_codes));
   ctx_->inputs_ = std::move(inputs);
 }
 

@@ -212,7 +212,28 @@ resume 时的树版本一致性校验。
   裁剪(#ifdef 拆 journal/checkpoint/pack)推迟:churn 大而当前无
   MCU 硬目标;等真实目标出现按其预算裁剪。
 
-### 4.12 测试替身(M3)
+### 4.12 Agent 骨架(M8,已实现)
+
+- **LLMDecision**:LLM 只做"选分支",控制流仍在树里。客户端经能力
+  接口注入(`LlmDecision::Client`,核心库零 HTTP 依赖);分支集合即
+  schema,越界输出 → `LLM_INVALID_BRANCH`。配套 SDK 保留键约定:
+  done 的 result 携带 `__fail_code`/`__fail_message` 时由桥在调度线程
+  代记结构化失败——任意线程回调的校验逻辑零 ctx 访问。
+- **失败码登记表**:失败码是接口,先声明后使用(Engine / pack 清单
+  `failure_codes`);未登记码运行时标记 `undeclared_code`,explain 可筛。
+  登记表为空 = 不校验,向后兼容。
+- **"LLM 提议,守护裁决"**:LLMDecision 选分支 + ReactiveGuard 包住
+  执行段——决策可信的前提是守护条件持续成立(game_npc 场景 E3:
+  交战中玩家撤离,守护否决决策、halt 在途交战)。
+- **validate 护栏闭环**:`nebula validate --json` 机器可读输出,
+  LLM 生成树草稿 → 校验 → 错误回灌修复 → 人审入库。
+- **实现教训(v4 重 tick 语义)**:`Sequence` 是记忆式(已完成子节点
+  不重跑),`ReactiveSequence/ReactiveFallback` 每 tick 从头重估并 halt
+  其他分支——LLM 决策放记忆式段(只决策一次),感知刷新放反应式段
+  (守护读到的黑板恒新鲜)。守护成立路径必须照常 tick 子节点,否则
+  异步 done 结果无法应用(回归见 game_npc E2)。
+
+### 4.13 测试替身(M3)
 
 `testkit::ScriptedAction`:按脚本返回(`then / thenFail / always`),
 自动录制每次激活的输入端口快照(`calls()`,经 `NebulaCtx::inputsJson()`)。
@@ -242,6 +263,7 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 | **M5 ✅** | **韧性原语**:Compensable Saga 补偿 ✅;ReactiveGuard 运行期守护 ✅;资源仲裁 ✅;order_fulfillment 声明式补偿 ✅ | 补偿逆序/超时补偿/取消不补偿有测试;守护破坏 halt + fail-closed 有测试;资源冲突拒绝/终态释放有测试 |
 | **M6 ✅** | **确定性内核**:时钟注入(VirtualClock,advanceTime 两相推进)✅;故障注入 kit(testkit::flaky)✅;恢复性质测试 harness(200 轮随机交错)✅;`nebula replay` CLI ✅;journal/explain CLI 帧格式自适应 ✅ | 重试/超时/watchdog 虚拟时间零等待;性质测试断言已记录检查点副作用绝不再执行;replay 预演与引擎恢复语义一致 |
 | **M7 ✅** | **可观测与便携**:Groot2 实时可视化 ✅;运行中 explain(调度线程快照)✅;树嵌入二进制(nebulabt_embed_trees)✅;失败自动富化 ✅;尺寸基准 ~1.26 MB text | RUNNING 中 explain 有并发测试;嵌入树提交等同文件提交;groot2 端口占用不炸 |
+| **M8 ✅** | **Agent 骨架**:LLMDecision 节点(能力接口注入,分支即 schema)✅;失败码登记表(Engine/pack 声明,undeclared_code 标记)✅;game_npc 场景 E(LLM 提议,守护裁决)✅;validate --json 护栏闭环 ✅ | 幻觉分支拦截有测试;未登记失败码可筛;守护否决 LLM 决策可跑可断言 |
 
 ## 6. 已知限制
 

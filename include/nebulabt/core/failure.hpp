@@ -4,6 +4,7 @@
 
 #include <behaviortree_cpp/contrib/json.hpp>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,6 +22,23 @@ struct FailureRecord {
   /// 失败时的输入端口快照(激活时刻,{key} 已解析为黑板值)——
   /// 排障时不用猜"当时参数是什么"(M7 富化;桥自动填充)
   nlohmann::json inputs = nlohmann::json::object();
+  /// 失败码未在登记表声明(M8):true = 拼写错误或漏声明,explain 可筛
+  bool undeclared_code = false;
+};
+
+/// 失败码登记表(M8):失败码是接口——先声明后使用。
+/// 表为空 = 未启用校验(known 恒 true,向后兼容)。
+/// 声明入口:Engine::declareFailureCodes / pack 清单 task.failure_codes。
+class FailureCodeTable {
+public:
+  void declare(const std::string& code, const std::string& description);
+  /// 表非空且未登记 => false
+  bool known(const std::string& code) const;
+  std::map<std::string, std::string> snapshot() const;
+
+private:
+  mutable std::mutex mu_;
+  std::map<std::string, std::string> codes_;  // code -> description
 };
 
 void to_json(nlohmann::json& j, const FailureRecord& r);

@@ -61,6 +61,10 @@ struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost,
   std::unordered_map<std::string, std::vector<std::string>> task_resources;
   // mu 保护;task_id -> 声明的资源
 
+  // ---- 失败码登记表(M8)----
+  std::shared_ptr<FailureCodeTable> failure_codes =
+      std::make_shared<FailureCodeTable>();
+
   /// 启动任务的 watchdog 巡检定时器(interval>0 时)
   void armWatchdog(std::shared_ptr<TaskContext> ctx, uint64_t interval);
 

@@ -4,6 +4,7 @@
 #include <nebulabt/core/engine.hpp>
 #include <nebulabt/core/journal_file.hpp>
 #include <nebulabt/core/scheduler.hpp>
+#include <nebulabt/nodes/llm_decision.hpp>
 #include <nebulabt/sdk/action.hpp>
 #include <nebulabt/testkit/mock.hpp>
 
@@ -1175,6 +1176,120 @@ static void test_m7_observability() {
   }
 }
 
+// ---- M8:失败码登记表 + LLMDecision ----
+static void test_m8_agent() {
+  // 1) 失败码登记表:未登记的码被标记 undeclared_code
+  {
+    Engine engine;
+    engine.declareFailureCodes({{"E_KNOWN", "a known code"}});
+    engine.registerAction("Boom", std::make_shared<Boom>());
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Boom/></BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Failed);
+    auto failures = task.failures();
+    CHECK(failures.size() == 1);
+    CHECK(failures[0].code == "E_TEST");        // Boom 用的是未登记码
+    CHECK(failures[0].undeclared_code == true);
+
+    // 登记后同一动作不再被标记
+    engine.declareFailureCodes({{"E_TEST", "boom on purpose"}});
+    auto task2 = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Boom/></BehaviorTree></root>)");
+    CHECK(task2.wait() == TaskState::Failed);
+    CHECK(task2.failures()[0].undeclared_code == false);
+  }
+
+  // 2) LLMDecision:合法分支 → 输出写回;幻觉分支 → LLM_INVALID_BRANCH
+  {
+    Engine engine;
+    // 捕获决策输出
+    auto observed = std::make_shared<std::string>();
+    class Observe : public NebulaAction {
+    public:
+      std::shared_ptr<std::string> out;
+      BT::PortsList providedPorts() const override {
+        return { BT::InputPort<std::string>("branch") };
+      }
+      NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        *out = ctx.in<std::string>("branch");
+        return NodeStatus::SUCCESS;
+      }
+    };
+    auto obs = std::make_shared<Observe>();
+    obs->out = observed;
+    engine.registerAction("Observe", obs);
+
+    // 同步 mock 客户端:第一次返回合法分支,第二次幻觉
+    auto callCount = std::make_shared<std::atomic<int>>(0);
+    LlmDecision::Client client = [callCount](const nlohmann::json& req,
+                                             Done done) {
+      const bool hallucinate = callCount->fetch_add(1) == 1;
+      done(NodeStatus::SUCCESS, nlohmann::json{
+        {"branch", hallucinate ? "teleport" : "patrol"},
+        {"reason", "mock"},
+      });
+    };
+    engine.registerAction("LLMDecision",
+                          std::make_shared<LlmDecision>(client));
+
+    const char* xml = R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <LLMDecision prompt="{situation}" branches="patrol,engage,retreat"
+                       branch="{decision}"/>
+          <Observe branch="{decision}"/>
+        </Sequence>
+      </BehaviorTree></root>)";
+
+    TaskSpec s1;
+    s1.slots["situation"] = "quiet sector";
+    auto t1 = engine.submitFromText(xml, s1);
+    CHECK(t1.wait() == TaskState::Succeeded);
+    CHECK(*observed == "patrol");               // 分支写回 Output 端口
+
+    TaskSpec s2;
+    s2.slots["situation"] = "anything";
+    auto t2 = engine.submitFromText(xml, s2);
+    CHECK(t2.wait() == TaskState::Failed);      // 幻觉分支被拦截
+    auto failures = t2.failures();
+    CHECK(failures.size() == 1);
+    CHECK(failures[0].code == "LLM_INVALID_BRANCH");
+    CHECK(failures[0].node_type == "LLMDecision");
+  }
+
+  // 3) 异步客户端(独立线程)+ branches 为空
+  {
+    Engine engine;
+    LlmDecision::Client asyncClient = [](const nlohmann::json&, Done done) {
+      std::thread([done] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        done(NodeStatus::SUCCESS, nlohmann::json{{"branch", "engage"},
+                                                 {"reason", "threat"}});
+      }).detach();
+    };
+    engine.registerAction("LLMDecision",
+                          std::make_shared<LlmDecision>(asyncClient));
+    engine.registerAction("Ok", std::make_shared<Ok>());
+
+    auto t1 = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <LLMDecision prompt="x" branches="patrol,engage" branch="{d}"/>
+          <Ok/>
+        </Sequence>
+      </BehaviorTree></root>)");
+    CHECK(t1.wait() == TaskState::Succeeded);
+
+    auto t2 = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <LLMDecision prompt="x" branches="" branch="{d}"/>
+      </BehaviorTree></root>)");
+    CHECK(t2.wait() == TaskState::Failed);
+    CHECK(t2.failures()[0].code == "LLM_NO_BRANCHES");
+  }
+}
+
 // ---- M5.1:Compensable Saga 补偿 ----
 static void test_compensable() {
   // 补偿动作:按执行顺序记录释放的 id
@@ -1554,6 +1669,8 @@ int main() {
   std::cout << "ok  virtual clock (retry/timeout/watchdog instant)\n";
   test_m7_observability();
   std::cout << "ok  m7 observability (failure inputs / runtime explain / groot2)\n";
+  test_m8_agent();
+  std::cout << "ok  m8 agent (failure code registry / LLM decision guardrails)\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

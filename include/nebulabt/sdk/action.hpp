@@ -26,6 +26,11 @@ class BridgeNode;
 /// 完成续传回调。业务代码完成后在任意线程调用:
 ///   done(BT::NodeStatus::SUCCESS, {{"price", 3.14}});
 /// result 中的键会按端口声明写回该节点的 Output 端口。
+///
+/// 保留键(M8):done 在任意线程执行时无法安全访问 ctx;result 可携带
+///   "__fail_code" / "__fail_message"
+/// 由桥在调度线程内代记结构化失败——异步包装器的校验逻辑只依赖捕获
+/// 副本,零 ctx 访问,天然线程安全。
 using Done = std::function<void(BT::NodeStatus status, nlohmann::json result)>;
 
 /// 节点执行上下文:类型化端口读写 + 任务元信息 + 结构化失败记录。
@@ -63,10 +68,12 @@ public:
 private:
   friend class detail::BridgeNode;
   NebulaCtx(BT::TreeNode& node, std::shared_ptr<FailureLog> failures,
-            std::string taskId, std::string taskType);
+            std::string taskId, std::string taskType,
+            std::shared_ptr<FailureCodeTable> codes);
 
   BT::TreeNode* node_;
   std::shared_ptr<FailureLog> failures_;
+  std::shared_ptr<FailureCodeTable> codes_;
   std::string task_id_;
   std::string task_type_;
   nlohmann::json inputs_ = nlohmann::json::object();  // 激活时的输入快照

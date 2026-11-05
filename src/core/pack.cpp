@@ -48,6 +48,17 @@ PackTaskSpec parseTaskEntry(const std::string& key, const nlohmann::json& v) {
       timeout != v.end() && timeout->is_number_unsigned()) {
     spec.timeout_ms = timeout->get<uint64_t>();
   }
+  if (auto codes = v.find("failure_codes");
+      codes != v.end() && codes->is_object()) {
+    for (auto it = codes->begin(); it != codes->end(); ++it) {
+      if (!it.value().is_string()) {
+        throw std::runtime_error("pack manifest: entry '" + key +
+                                 "' failure_codes." + it.key() +
+                                 "' must be a string description");
+      }
+      spec.failure_codes[it.key()] = it.value().get<std::string>();
+    }
+  }
   return spec;
 }
 } // namespace

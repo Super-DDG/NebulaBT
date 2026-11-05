@@ -51,6 +51,9 @@ struct PackTaskSpec {
   nlohmann::json schema = nlohmann::json::object();
   nlohmann::json slot_defaults = nlohmann::json::object();  // 实例默认 slots
   uint64_t timeout_ms = 0;
+  /// 失败码登记(M8,可选):{"CODE": "说明"} — loadPack 时声明进引擎,
+  /// 未声明的失败码在运行时被标记 undeclared_code
+  std::map<std::string, std::string> failure_codes;
 };
 
 struct PackManifest {

@@ -14,6 +14,7 @@ void to_json(nlohmann::json& j, const FailureRecord& r) {
     {"attempt", r.attempt},
     {"timestamp", r.timestamp},
     {"inputs", r.inputs.is_object() ? r.inputs : nlohmann::json::object()},
+    {"undeclared_code", r.undeclared_code},
   };
 }
 
@@ -27,6 +28,23 @@ void from_json(const nlohmann::json& j, FailureRecord& r) {
   if (j.contains("inputs") && j["inputs"].is_object()) {
     r.inputs = j["inputs"];
   }
+  r.undeclared_code = j.value("undeclared_code", false);
+}
+
+void FailureCodeTable::declare(const std::string& code,
+                               const std::string& description) {
+  std::lock_guard<std::mutex> lk(mu_);
+  codes_[code] = description;
+}
+
+bool FailureCodeTable::known(const std::string& code) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return codes_.empty() || codes_.count(code) > 0;
+}
+
+std::map<std::string, std::string> FailureCodeTable::snapshot() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return codes_;
 }
 
 void FailureLog::add(FailureRecord record) {

@@ -84,20 +84,35 @@ static std::vector<nebulabt::JournalEvent> loadJournalAuto(
 }
 
 static int cmdValidate(int argc, char** argv) {
-  if (argc < 3) {
-    std::cerr << "usage: nebula validate <tree.xml> [schema.json]\n";
+  bool jsonOut = false;
+  std::string xmlPath, schemaPath;
+  for (int i = 2; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--json") {
+      jsonOut = true;
+    } else if (xmlPath.empty()) {
+      xmlPath = a;
+    } else if (schemaPath.empty()) {
+      schemaPath = a;
+    } else {
+      std::cerr << "usage: nebula validate <tree.xml> [schema.json] [--json]\n";
+      return 2;
+    }
+  }
+  if (xmlPath.empty()) {
+    std::cerr << "usage: nebula validate <tree.xml> [schema.json] [--json]\n";
     return 2;
   }
   std::string xml;
-  if (!readFile(argv[2], &xml)) {
-    std::cerr << "error: cannot read " << argv[2] << "\n";
+  if (!readFile(xmlPath, &xml)) {
+    std::cerr << "error: cannot read " << xmlPath << "\n";
     return 2;
   }
   nlohmann::json schema = nlohmann::json::object();
-  if (argc >= 4) {
+  if (!schemaPath.empty()) {
     std::string schemaText;
-    if (!readFile(argv[3], &schemaText)) {
-      std::cerr << "error: cannot read " << argv[3] << "\n";
+    if (!readFile(schemaPath, &schemaText)) {
+      std::cerr << "error: cannot read " << schemaPath << "\n";
       return 2;
     }
     try {
@@ -110,14 +125,25 @@ static int cmdValidate(int argc, char** argv) {
 
   nebulabt::Engine engine;
   const auto errors = engine.validate(xml, schema);
+  if (jsonOut) {
+    // 机器可读输出(M8):LLM 生成树草稿 -> validate --json -> 错误回灌
+    // 修复 -> 人审入库的护栏闭环
+    nlohmann::json out{
+      {"file", xmlPath},
+      {"ok", errors.empty()},
+      {"errors", errors},
+    };
+    std::cout << out.dump() << "\n";
+    return errors.empty() ? 0 : 1;
+  }
   if (errors.empty()) {
-    std::cout << argv[2] << ": OK\n";
+    std::cout << xmlPath << ": OK\n";
     return 0;
   }
   for (const auto& e : errors) {
     std::cerr << "error: " << e << "\n";
   }
-  std::cerr << argv[2] << ": " << errors.size() << " error(s)\n";
+  std::cerr << xmlPath << ": " << errors.size() << " error(s)\n";
   return 1;
 }
 
@@ -436,7 +462,7 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: nebula <command> [args]\n"
               << "commands:\n"
-              << "  validate <tree.xml> [schema.json]\n"
+              << "  validate <tree.xml> [schema.json] [--json]\n"
               << "  journal  <file.jsonl>\n"
               << "  doc      <tree.xml>\n"
               << "  explain  <journal.jsonl> [task_id]\n"

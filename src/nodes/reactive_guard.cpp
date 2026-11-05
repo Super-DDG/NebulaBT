@@ -88,10 +88,8 @@ BT::NodeStatus ReactiveGuardNode::tick() {
   }
   inspection_armed_ = false;  // 本 tick 重新决定是否武装
 
-  const bool childActive = child()->status() == BT::NodeStatus::RUNNING;
-
   if (!guardHolds()) {
-    if (childActive) {
+    if (child()->status() == BT::NodeStatus::RUNNING) {
       haltChild();  // 守护破坏:打断在途工作(动作收到 halt 回调)
     }
     if (host_) {
@@ -100,21 +98,13 @@ BT::NodeStatus ReactiveGuardNode::tick() {
     return BT::NodeStatus::FAILURE;
   }
 
-  if (child()->status() == BT::NodeStatus::IDLE) {
-    const BT::NodeStatus st = child()->executeTick();
-    if (st == BT::NodeStatus::RUNNING) {
-      armInspection();
-    }
-    return st;
-  }
-
-  if (childActive) {
+  // 守护成立:照常 tick 子节点——重 tick 是异步动作应用 done 结果的
+  // 唯一通道(漏掉会导致任务永久卡在 RUNNING,M7 修复的回归测试覆盖)
+  const BT::NodeStatus st = child()->executeTick();
+  if (st == BT::NodeStatus::RUNNING) {
     armInspection();
-    return BT::NodeStatus::RUNNING;
   }
-
-  // 子树终态(重 tick 透传缓存状态),巡检随之停止
-  return child()->status();
+  return st;
 }
 
 void ReactiveGuardNode::halt() {

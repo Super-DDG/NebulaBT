@@ -3,6 +3,33 @@
 All notable changes to NebulaBT are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased] - M8 Agent 骨架
+
+### Added
+
+- **LLMDecision 节点**:`nodes/llm_decision.hpp` — LLM 只做"选分支",
+  控制流仍在树里。LLM 客户端经能力接口注入(核心库零 HTTP 依赖);
+  分支集合即 schema,输出不在集合内 → `LLM_INVALID_BRANCH`(幻觉被拦在
+  节点边界);`__fail_code` 保留键约定:done 在任意线程执行时无法访问
+  ctx,由桥在调度线程内代记结构化失败——异步包装器校验逻辑只依赖
+  捕获副本,天然线程安全。
+- **失败码登记表**:失败码是接口,先声明后使用。
+  `Engine::declareFailureCodes()` / pack 清单 `task.failure_codes`;
+  未登记的码在 FailureRecord 标记 `undeclared_code`(explain 可筛出
+  拼写错误);登记表为空 = 不校验(向后兼容)。
+- **game_npc 场景 E**:LLM 驱动决策三连——决策巡逻 / 决策交战完成 /
+  **交战中玩家撤离 → ReactiveGuard 裁决否决 LLM 决策**(GUARD_VIOLATED,
+  在途交战被 halt)。"LLM 提议,守护裁决"完整可跑;explain 输出
+  决策 + 违规的审计链。
+- **`nebula validate --json`**:机器可读输出,LLM 生成树草稿 → 校验 →
+  错误回灌修复 → 人审入库的护栏闭环。
+
+### Fixed
+
+- **ReactiveGuard 回归**:子节点 RUNNING 且守护成立的路径漏掉了
+  `child()->executeTick()` —— 异步动作的 done 结果永远无法被应用,
+  任务永久卡 RUNNING。守护成立时照常 tick 子节点。
+
 ## [Unreleased] - M7 可观测与便携
 
 ### Added

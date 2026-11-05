@@ -14,6 +14,7 @@
 #include "nebulabt/core/task.hpp"
 #include "nebulabt/sdk/action.hpp"
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -95,6 +96,12 @@ public:
   /// 仅虚拟时钟模式:推进虚拟时间 ms,到期定时器(超时/重试延时/
   /// watchdog 巡检)随即在调度线程触发。真实时钟模式无效并告警。
   void advanceTime(uint64_t ms);
+
+  /// 失败码登记表(M8):失败码是接口——先声明后使用。
+  /// 声明后,ctx.fail() 使用未登记的码会在 FailureRecord 标记
+  /// undeclared_code(explain 可筛出拼写错误);登记表为空 = 不校验。
+  /// pack 清单的 task.failure_codes 在 loadPack 时自动声明。
+  void declareFailureCodes(const std::map<std::string, std::string>& codes);
 
   /// 任务 watchdog(M4):任务 RUNNING 期间超过 interval 毫秒无任何节点
   /// 状态迁移 → 触发回调并告警;halt_on_trigger 时同时 halt 整棵树、

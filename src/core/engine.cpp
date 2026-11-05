@@ -239,6 +239,12 @@ void Engine::loadPack(const std::string& manifestDir) {
     core_->packs.push_back(detail::EngineCore::PackEntry{
         std::move(manifest), manifestDir});
   }
+  // M8:pack 声明的失败码登记进引擎(先声明后使用)
+  for (const auto& [taskType, task] : manifest.tasks) {
+    for (const auto& [code, desc] : task.failure_codes) {
+      core_->failure_codes->declare(code, desc);
+    }
+  }
   core_->logf(LogLevel::Info, "pack loaded (see journal for details)");
 }
 
@@ -340,6 +346,13 @@ void Engine::advanceTime(uint64_t ms) {
   if (!core_->scheduler.advanceVirtualTime(ms)) {
     core_->logf(LogLevel::Warn,
                 "advanceTime ignored: engine is not in virtual-clock mode");
+  }
+}
+
+void Engine::declareFailureCodes(
+    const std::map<std::string, std::string>& codes) {
+  for (const auto& [code, desc] : codes) {
+    core_->failure_codes->declare(code, desc);
   }
 }
 
