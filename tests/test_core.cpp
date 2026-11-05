@@ -670,6 +670,31 @@ static void test_checkpoint_resume_across_engines() {
   CHECK(side->calls.load() == 0);  // 副作用从未在新进程中执行——检查点跳过
 }
 
+static void test_explain_timing() {
+  Engine engine;
+  engine.registerAction("AsyncOk", std::make_shared<AsyncOk>());
+  engine.registerAction("Ok", std::make_shared<Ok>());
+
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Sequence>
+        <AsyncOk value="{v}"/>
+        <Ok/>
+      </Sequence>
+    </BehaviorTree></root>)");
+  CHECK(task.wait() == TaskState::Succeeded);
+
+  auto report = task.explain();
+  const auto& tree = report["tree"];
+  CHECK(tree["children"][0]["type"] == "AsyncOk");
+  // 异步节点:1 次 attempt,RUNNING 时长 ≈ 50ms(允许调度误差)
+  const int attempts = tree["children"][0]["attempts"].get<int>();
+  const double runningMs = tree["children"][0]["running_ms"].get<double>();
+  CHECK(attempts == 1);
+  CHECK(runningMs >= 40.0);
+  CHECK(tree["children"][1]["attempts"].get<int>() == 1);  // 同步 Ok
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -705,6 +730,8 @@ int main() {
   std::cout << "ok  checkpoint resume\n";
   test_checkpoint_resume_across_engines();
   std::cout << "ok  checkpoint resume across engines\n";
+  test_explain_timing();
+  std::cout << "ok  explain timing\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

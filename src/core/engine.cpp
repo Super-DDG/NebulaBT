@@ -12,12 +12,14 @@
 #include <behaviortree_cpp/blackboard.h>
 #include <behaviortree_cpp/control_node.h>
 #include <behaviortree_cpp/decorator_node.h>
+#include <behaviortree_cpp/loggers/abstract_logger.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -47,10 +49,72 @@ namespace detail {
 
 struct EngineCore;
 
+// ---- 节点计时(explain 完整版)----
+// 每次 IDLE->RUNNING 计一次 attempt;RUNNING->终态 累计运行时长。
+struct NodeStat {
+  int attempts = 0;
+  double running_ms = 0;   // 累计 RUNNING 时长(相对任务起点)
+  double first_ms = -1;    // 首次状态迁移
+  double last_ms = -1;     // 最近状态迁移
+  double run_start_ms = 0; // 本次 RUNNING 的起点
+  bool in_running = false;
+};
+
+struct NodeStatsMap {
+  std::mutex mu;
+  std::map<std::string, NodeStat> by_path;
+};
+
+// 订阅全树状态迁移(BT.CPP StatusChangeLogger),填充 NodeStatsMap。
+// 时间戳用相对模式(相对 logger 构造时刻 ≈ 任务提交时刻)。
+class TaskTraceLogger : public BT::StatusChangeLogger {
+public:
+  TaskTraceLogger(BT::TreeNode* root, std::shared_ptr<NodeStatsMap> stats)
+    : BT::StatusChangeLogger(root), stats_(std::move(stats)) {
+    setTimestampType(BT::TimestampType::relative);
+  }
+
+  void callback(BT::Duration timestamp, const BT::TreeNode& node,
+                BT::NodeStatus prev, BT::NodeStatus status) override {
+    const double ms =
+        std::chrono::duration<double, std::milli>(timestamp).count();
+    std::lock_guard<std::mutex> lk(stats_->mu);
+    auto& st = stats_->by_path[node.fullPath()];
+    if (st.first_ms < 0) st.first_ms = ms;
+    st.last_ms = ms;
+
+    if (status == BT::NodeStatus::RUNNING) {
+      if (prev == BT::NodeStatus::IDLE) {
+        st.attempts++;
+      }
+      st.run_start_ms = ms;
+      st.in_running = true;
+    } else if (status == BT::NodeStatus::SUCCESS ||
+               status == BT::NodeStatus::FAILURE ||
+               status == BT::NodeStatus::IDLE) {
+      if (prev == BT::NodeStatus::IDLE) {
+        // 同步节点:IDLE 直达终态,没有 RUNNING 迁移
+        st.attempts++;
+      }
+      if (st.in_running) {
+        st.running_ms += ms - st.run_start_ms;
+        st.in_running = false;
+      }
+    }
+  }
+
+  void flush() override {}
+
+private:
+  std::shared_ptr<NodeStatsMap> stats_;
+};
+
 struct TaskContext {
   std::string task_id;
   std::string task_type;
   std::shared_ptr<BT::Tree> tree;
+  std::shared_ptr<NodeStatsMap> node_stats = std::make_shared<NodeStatsMap>();
+  std::shared_ptr<BT::StatusChangeLogger> trace;  // 声明在 tree 之后:先于树析构
   std::shared_ptr<FailureLog> failures = std::make_shared<FailureLog>();
   std::atomic<TaskState> state{TaskState::Queued};
   std::atomic<bool> finished{false};
@@ -386,8 +450,9 @@ private:
   size_t failCountAtStart_ = 0;
 };
 
-// explain() 的树遍历:节点路径 + 当前状态
-static nlohmann::json walkNode(const BT::TreeNode* node, const std::string& path) {
+// explain() 的树遍历:节点路径 + 当前状态 + 计时(attempts / running_ms)
+static nlohmann::json walkNode(const BT::TreeNode* node, const std::string& path,
+                               detail::NodeStatsMap* stats) {
   nlohmann::json j;
   j["name"] = node->name();
   j["type"] = node->registrationName();
@@ -396,14 +461,26 @@ static nlohmann::json walkNode(const BT::TreeNode* node, const std::string& path
       path.empty() ? node->name() : path + "/" + node->name();
   j["path"] = here;
 
+  if (stats) {
+    std::lock_guard<std::mutex> lk(stats->mu);
+    auto it = stats->by_path.find(node->fullPath());
+    if (it != stats->by_path.end()) {
+      const auto& st = it->second;
+      j["attempts"] = st.attempts;
+      j["running_ms"] = std::round(st.running_ms * 10.0) / 10.0;
+      j["first_ms"] = std::round(st.first_ms * 10.0) / 10.0;
+      j["last_ms"] = std::round(st.last_ms * 10.0) / 10.0;
+    }
+  }
+
   nlohmann::json children = nlohmann::json::array();
   if (auto ctrl = dynamic_cast<const BT::ControlNode*>(node)) {
     for (const BT::TreeNode* child : ctrl->children()) {
-      children.push_back(walkNode(child, here));
+      children.push_back(walkNode(child, here, stats));
     }
   } else if (auto dec = dynamic_cast<const BT::DecoratorNode*>(node)) {
     if (dec->child()) {
-      children.push_back(walkNode(dec->child(), here));
+      children.push_back(walkNode(dec->child(), here, stats));
     }
   }
   j["children"] = children;
@@ -679,6 +756,9 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
   ctx->task_id = spec.task_id;
   ctx->task_type = spec.task_type;
   ctx->tree = tree;
+  // 节点计时:订阅全树状态迁移(相对任务提交时刻)
+  ctx->trace = std::make_shared<detail::TaskTraceLogger>(tree->rootNode(),
+                                                         ctx->node_stats);
   {
     // 断点恢复(M2):从上一轮 journal 提取已完成的检查点快照
     std::lock_guard<std::mutex> lk(ctx->journal_mu);
@@ -814,7 +894,8 @@ nlohmann::json TaskHandle::explain() const {
   j["task_type"] = ctx_->task_type;
   j["state"] = toString(ctx_->state.load());
   if (ctx_->tree && ctx_->tree->rootNode()) {
-    j["tree"] = detail::walkNode(ctx_->tree->rootNode(), "");
+    j["tree"] = detail::walkNode(ctx_->tree->rootNode(), "",
+                                 ctx_->node_stats.get());
   }
   j["failures"] = failures();
   return j;

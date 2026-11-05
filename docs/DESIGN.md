@@ -70,9 +70,10 @@ NebulaBT 是一个面向业务开发的行为树编排框架,目标行业:机器
 - **失败自动捕获**:动作返回 FAILURE 却没调用 `ctx.fail()` 时,框架兜底记录
   `NODE_FAILURE`——失败可解释不依赖作者自觉
 - 任务终态可查询:`task.failures()` 返回结构化记录数组
-- `task.explain()` 返回完整执行报告:树形结构 + 各节点状态 + 失败记录
+- `task.explain()` 返回完整执行报告:树形结构 + 各节点状态 + 失败记录 +
+  **节点计时**(attempts / running_ms,经 BT.CPP StatusChangeLogger 订阅全树迁移)
 
-规划:策略层填充 attempt 重试计数;失败码登记表。
+规划:失败码登记表。
 
 ### 4.3 动态树原语(已实现:ForEach)
 
@@ -148,14 +149,23 @@ resume 时的树版本一致性校验。
 
 树是带版本的业务资产:模板树 + 实例覆写(变体不 fork);树包可被引用(`requires: deliver_pack >= 2.1`);任务级灰度路由。
 
+### 4.9 `nebula` CLI(部分实现)
+
+```
+nebula validate <tree.xml> [schema.json]   # 加载期校验,CI 门禁(M1)
+nebula journal  <file.jsonl>               # 检查持久化 journal:事件分布、
+                                           # 任务终态、检查点清单(恢复前排查)
+```
+规划:explain / replay / doc(见路线图)。
+
 ## 5. 路线图 {#roadmap}
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0 ✅** | 核心骨架:调度器 / SDK / Bridge / ForEach / 失败记录 / explain / 取消 | hello_tree 跑通;单测覆盖同步/异步/遍历/取消/定时器 |
 | **M1 ✅** | 类型化 schema 校验(L1+L2)✅;策略(超时 ✅ / RetryWithDelay ✅ / 墙钟预算 ✅);失败自动捕获 ✅;`nebula validate` CLI ✅ | **试金石通过**:`examples/robot_delivery` 演示典型"拣选-递送"业务,搜寻段 N 份复制 → 1 份数据驱动,全树在 schema 严格模式下自洽 |
-| **M2(核心已达成)** | journal 事件日志 ✅;Checkpoint 装饰器 ✅;断点恢复(含跨进程)✅;动态树原语补齐(WhileLoop/SwitchN)✅ | 恢复演示:递交失败重跑,已完成段整体跳过、副作用不重复;17 组单测 |
-| M2 收尾 | explain 完整版(节点耗时/attempt);journal 回放回归工具 | kill -9 后断点续跑演示 |
+| **M2(核心已达成)** | journal 事件日志 ✅;Checkpoint 装饰器 ✅;断点恢复(含跨进程)✅;动态树原语补齐(WhileLoop/SwitchN)✅ | 恢复演示:递交失败重跑,已完成段整体跳过、副作用不重复 |
+| **M2 ✅** | explain 完整版(节点 attempts / running_ms)✅;**kill -9 实机恢复测试** ✅(fork 子进程真杀 + journal 落盘 + 新进程恢复);`nebula journal` CLI ✅ | tests/kill9:检查点先落盘 → SIGKILL → 新进程恢复,副作用零重复 |
 | M3 | 树包版本化与灰度路由;Mock 自动生成;自动流程文档 | 1.0 发布 |
 
 ## 6. 已知限制

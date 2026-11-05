@@ -1,3 +1,11 @@
 add_executable(nebulabt_tests test_core.cpp)
 target_link_libraries(nebulabt_tests PRIVATE nebulabt::nebulabt)
 add_test(NAME nebulabt_tests COMMAND nebulabt_tests)
+
+# kill -9 实机恢复测试(依赖 fork/SIGKILL,仅 POSIX)
+if(UNIX AND NOT APPLE)
+  add_executable(nebulabt_kill9 test_kill9.cpp)
+  target_link_libraries(nebulabt_kill9 PRIVATE nebulabt::nebulabt)
+  add_test(NAME nebulabt_kill9 COMMAND nebulabt_kill9)
+  set_tests_properties(nebulabt_kill9 PROPERTIES TIMEOUT 60)
+endif()
