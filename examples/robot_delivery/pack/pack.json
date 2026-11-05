@@ -2,8 +2,8 @@
   "name": "pick_and_deliver",
   "version": "1.0.0",
   "trees_dir": "trees",
-  "task_types": {
-    "DELIVER_ORDER": {
+  "templates": {
+    "deliver": {
       "tree": "pick_and_deliver",
       "schema": {
         "slots": {
@@ -14,5 +14,9 @@
       },
       "timeout_ms": 60000
     }
+  },
+  "task_types": {
+    "DELIVER_ORDER": { "template": "deliver" },
+    "DELIVER_ORDER_FAST": { "template": "deliver", "slot_defaults": {"grasp_retry": 1} }
   }
 }

@@ -121,9 +121,49 @@ cmake --build build -j
 
 C++17, no other runtime dependencies beyond BehaviorTree.CPP.
 
+## Tree packs: trees are versioned assets
+
+Business trees ship as **packs** — a directory with a manifest:
+
+```json
+{
+  "name": "delivery", "version": "1.2.0",
+  "templates": {
+    "deliver": { "tree": "deliver_item",
+                 "schema": { "slots": { "target_item": {"type":"string","required":true} } },
+                 "timeout_ms": 60000 }
+  },
+  "task_types": {
+    "DELIVER_ORDER":      { "template": "deliver" },
+    "DELIVER_ORDER_FAST": { "template": "deliver", "slot_defaults": {"grasp_retry": 1} }
+  }
+}
+```
+
+```cpp
+engine.loadPack("packs/delivery/1.2.0");  // load = validate every tree (CI gate)
+auto task = engine.submitTask(spec);      // task_type -> pack -> tree
+engine.setCanary("delivery", "1.3.0", 10); // 10% of new tasks try the canary
+```
+
+Load-time validation rejects broken trees before any task runs. Variants are
+template instances with slot defaults — not forked XML. Canary routing is a
+deterministic task-id hash; recovery replays pin the original version.
+
+## CLI
+
+```
+nebula validate <tree.xml> [schema.json]   # load-time validation (CI gate)
+nebula journal  <journal.jsonl>            # inspect persisted journals
+nebula explain  <journal.jsonl> [task_id]  # post-mortem: timeline, checkpoints, outcome
+nebula doc      <tree.xml>                 # tree -> mermaid flowchart
+```
+
 ## Status
 
-Experimental (M0). See the [roadmap](docs/DESIGN.md#roadmap).
+**1.0.0** — the core feature set is complete and regression-tested
+(21 test cases, including a real fork + `SIGKILL` recovery test).
+See the [roadmap](docs/DESIGN.md#roadmap) for what's next.
 
 Explicit non-goals: not a BPMN / human-workflow engine, not a rules engine,
 single-process only (journal design leaves the door open).

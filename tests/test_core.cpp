@@ -825,6 +825,72 @@ static void test_scripted_mock() {
   CHECK(calls[1]["point_id"] == "kitchen");
 }
 
+static void test_template_and_requires() {
+  // pack:模板 "work" 声明树+schema;任务经 template 引用,slot_defaults 给默认值
+  const std::string dir = "/tmp/nebulabt_tpl_test";
+  mkdir("/tmp/nebulabt_tpl_test", 0755);
+  mkdir(dir.c_str(), 0755);
+  mkdir((dir + "/trees").c_str(), 0755);
+  std::ofstream(dir + "/pack.json") << R"({
+    "name": "tplpack", "version": "1.0.0",
+    "templates": {
+      "work": { "tree": "tpl_tree",
+                "schema": {"slots": {"n": {"type": "int", "required": true}}} }
+    },
+    "task_types": {
+      "TPL_TASK": { "template": "work", "slot_defaults": {"n": 7} }
+    }
+  })";
+  std::ofstream(dir + "/trees/tpl_tree.xml") << R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <ReadInt n="{n}"/>
+    </BehaviorTree></root>)";
+
+  Engine engine;
+  engine.registerAction("ReadInt", std::make_shared<ReadInt>());
+  engine.loadPack(dir);
+
+  // 提交未给 n -> slot_defaults 注入 7 -> ReadInt 判定成功(模板+默认值贯通)
+  TaskSpec spec;
+  spec.task_type = "TPL_TASK";
+  auto task = engine.submitTask(spec);
+  CHECK(!task.empty());
+  CHECK(task.wait() == TaskState::Succeeded);
+
+  // requires:依赖未加载的 pack -> loadPack 抛异常;补齐后通过
+  const std::string dir2 = "/tmp/nebulabt_req_test";
+  mkdir("/tmp/nebulabt_req_test", 0755);
+  mkdir(dir2.c_str(), 0755);
+  mkdir((dir2 + "/trees").c_str(), 0755);
+  std::ofstream(dir2 + "/pack.json") << R"({
+    "name": "reqpack", "version": "1.0.0",
+    "requires": [{"pack": "tplpack", "min_version": "1.0.0"}],
+    "task_types": {
+      "REQ_TASK": { "template": "work" }
+    },
+    "templates": {
+      "work": { "tree": "tpl_tree",
+                "schema": {"slots": {"n": {"type": "int", "required": true}}} }
+    }
+  })";
+  std::ofstream(dir2 + "/trees/tpl_tree.xml") << R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <ReadInt n="{n}"/>
+    </BehaviorTree></root>)";
+
+  Engine fresh;  // tplpack 未加载
+  fresh.registerAction("ReadInt", std::make_shared<ReadInt>());
+  bool threw = false;
+  try {
+    fresh.loadPack(dir2);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CHECK(threw);  // 依赖未满足
+  fresh.loadPack(dir);   // 先加载依赖
+  fresh.loadPack(dir2);  // 再加载依赖方:通过
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -866,6 +932,8 @@ int main() {
   std::cout << "ok  pack loading + canary routing\n";
   test_scripted_mock();
   std::cout << "ok  scripted mock\n";
+  test_template_and_requires();
+  std::cout << "ok  template override + requires\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

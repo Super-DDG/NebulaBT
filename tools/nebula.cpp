@@ -15,6 +15,7 @@
 
 #include <tinyxml2.h>
 
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -195,13 +196,106 @@ static int cmdDoc(int argc, char** argv) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// nebula explain <journal.jsonl> [task_id]:任务事后分析
+// 时间线 + 检查点 + 终态原因;"这单为什么走了这条路"的命令行入口。
+// ---------------------------------------------------------------------------
+static double journalSeconds(const std::string& ts) {
+  // "YYYY-MM-DD HH:MM:SS.mmm" -> 当日秒数(同一任务的相对比较够用)
+  int Y, M, D, h, m, s, ms = 0;
+  if (std::sscanf(ts.c_str(), "%d-%d-%d %d:%d:%d.%d", &Y, &M, &D, &h, &m, &s,
+                  &ms) < 6) {
+    return 0.0;
+  }
+  return h * 3600.0 + m * 60.0 + s + ms / 1000.0;
+}
+
+static int cmdExplain(int argc, char** argv) {
+  if (argc < 3) {
+    std::cerr << "usage: nebula explain <journal.jsonl> [task_id]\n";
+    return 2;
+  }
+  std::ifstream f(argv[2]);
+  if (!f) {
+    std::cerr << "error: cannot read " << argv[2] << "\n";
+    return 2;
+  }
+  const std::string filter = argc >= 4 ? argv[3] : "";
+
+  // 收集每个任务的事件(保序)
+  std::vector<nebulabt::JournalEvent> all;
+  std::vector<std::string> taskOrder;
+  std::map<std::string, std::vector<nebulabt::JournalEvent>> byTask;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    try {
+      nebulabt::JournalEvent e =
+          nlohmann::json::parse(line).get<nebulabt::JournalEvent>();
+      if (e.task_id.empty()) continue;
+      if (!filter.empty() && e.task_id != filter) continue;
+      if (!byTask.count(e.task_id)) taskOrder.push_back(e.task_id);
+      byTask[e.task_id].push_back(std::move(e));
+    } catch (const std::exception&) {
+      // 容错跳过(崩溃瞬间的不完整行)
+    }
+  }
+  if (taskOrder.empty()) {
+    std::cout << "no events found"
+              << (filter.empty() ? "" : " for task " + filter) << "\n";
+    return 1;
+  }
+
+  // 默认只展示最后一个任务(排查焦点);传 task_id 可指定
+  const std::string& taskId = taskOrder.back();
+  const auto& events = byTask[taskId];
+
+  std::string taskType, pack, packVersion, state, reason;
+  double t0 = -1, t1 = -1;
+  std::cout << "task " << taskId << "\n";
+  for (const auto& e : events) {
+    taskType = e.task_type.empty() ? taskType : e.task_type;
+    if (e.data.contains("pack") && e.data["pack"].is_string()) {
+      pack = e.data["pack"].get<std::string>();
+      packVersion = e.data.value("pack_version", std::string());
+    }
+    const double sec = journalSeconds(e.timestamp);
+    if (t0 < 0) t0 = sec;
+    t1 = sec;
+    std::cout << "  [" << e.timestamp << "] " << e.event;
+    if (e.event == "checkpoint" || e.event == "checkpoint_restored") {
+      std::cout << " " << e.data.value("id", std::string());
+    }
+    if (e.event == "finished") {
+      state = e.data.value("state", std::string());
+      reason = e.data.value("reason", std::string());
+      std::cout << " " << state << (reason.empty() ? "" : " (" + reason + ")");
+    }
+    std::cout << "\n";
+  }
+  std::cout << "task_type: " << taskType;
+  if (!pack.empty()) {
+    std::cout << ", pack: " << pack << " v" << packVersion;
+  }
+  if (state == "SUCCEEDED" || state == "FAILED" || state == "CANCELED") {
+    std::cout << "\nduration: " << (t1 - t0) << " s, state: " << state
+              << (reason.empty() ? "" : " (" + reason + ")");
+  } else {
+    std::cout << "\n(no terminal event — task likely crashed mid-run; "
+                 "resume via TaskSpec.resume_journal)";
+  }
+  std::cout << "\n";
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: nebula <command> [args]\n"
               << "commands:\n"
               << "  validate <tree.xml> [schema.json]\n"
               << "  journal  <file.jsonl>\n"
-              << "  doc      <tree.xml>\n";
+              << "  doc      <tree.xml>\n"
+              << "  explain  <journal.jsonl> [task_id]\n";
     return 2;
   }
   const std::string cmd = argv[1];
@@ -213,6 +307,9 @@ int main(int argc, char** argv) {
   }
   if (cmd == "doc") {
     return cmdDoc(argc, argv);
+  }
+  if (cmd == "explain") {
+    return cmdExplain(argc, argv);
   }
   std::cerr << "error: unknown command '" << cmd << "'\n";
   return 2;

@@ -817,6 +817,29 @@ void Engine::loadPack(const std::string& manifestDir) {
   }
   auto manifest = parsePackManifest(j);
 
+  // requires:依赖 pack 必须已加载且版本达标(拆包有依赖顺序保障)
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    for (const auto& req : manifest.requires) {
+      bool satisfied = false;
+      for (const auto& p : core_->packs) {
+        if (p.manifest.name != req.pack) continue;
+        if (req.min_version.empty() ||
+            !detail::EngineCore::versionLess(p.manifest.version,
+                                             req.min_version)) {
+          satisfied = true;
+          break;
+        }
+      }
+      if (!satisfied) {
+        throw std::runtime_error(
+            "loadPack[" + manifest.name + "]: requires pack '" + req.pack +
+            "' >= " + (req.min_version.empty() ? "any" : req.min_version) +
+            " (load dependencies first)");
+      }
+    }
+  }
+
   {
     std::lock_guard<std::mutex> lk(core_->mu);
     for (const auto& p : core_->packs) {
@@ -878,6 +901,13 @@ TaskHandle Engine::submitTask(TaskSpec spec) {
   }
   if (spec.timeout_ms == 0) {
     spec.timeout_ms = task.timeout_ms;
+  }
+  // slot_defaults:提交未给的键用 pack 声明的默认值(变体不 fork 的机制)
+  for (auto it = task.slot_defaults.begin(); it != task.slot_defaults.end();
+       ++it) {
+    if (!spec.slots.contains(it.key())) {
+      spec.slots[it.key()] = it.value();
+    }
   }
   const std::string path = entry->dir + "/" + entry->manifest.trees_dir +
                            "/" + task.tree + ".xml";
