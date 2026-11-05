@@ -1,0 +1,18 @@
+{
+  "name": "pick_and_deliver",
+  "version": "1.0.0",
+  "trees_dir": "trees",
+  "task_types": {
+    "DELIVER_ORDER": {
+      "tree": "pick_and_deliver",
+      "schema": {
+        "slots": {
+          "target_item":     {"type": "string", "required": true},
+          "target_location": {"type": "string", "required": false},
+          "grasp_retry":     {"type": "int",    "required": false}
+        }
+      },
+      "timeout_ms": 60000
+    }
+  }
+}

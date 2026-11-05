@@ -9,6 +9,7 @@
 ///   task.wait();
 ///   task.explain();
 
+#include "nebulabt/core/pack.hpp"
 #include "nebulabt/core/task.hpp"
 #include "nebulabt/sdk/action.hpp"
 #include <functional>
@@ -44,6 +45,20 @@ public:
   TaskHandle submitFromText(const std::string& xmlText, TaskSpec spec = {});
   TaskHandle submitFromFile(const std::string& xmlPath, TaskSpec spec = {});
 
+  /// 加载树包(目录须含 pack.json)。加载即全量校验:每棵树可解析、
+  /// schema 数据流检查通过,失败抛异常——CI 中加载全部 pack 即门禁。
+  /// 注意:先 registerAction 再 loadPack(树中的节点必须已注册)。
+  void loadPack(const std::string& manifestDir);
+
+  /// 按 task_type 从已加载树包解析树文件并提交(spec.schema/timeout_ms
+  /// 未显式给出时,采用 pack 声明的默认值)
+  TaskHandle submitTask(TaskSpec spec);
+
+  /// 灰度路由:task_id 哈希 % 100 < percent 的任务路由到指定版本,
+  /// 其余走该 pack 的最高版本;TaskSpec.pack_version 显式钉住优先
+  void setCanary(const std::string& packName, const std::string& version,
+                 int percent);
+
   /// 加载期校验(不提交任务):解析树 + 按 schema 做 L2 树↔schema
   /// 数据流检查。返回错误列表(空 = 通过)。`nebula validate` CLI 的后端。
   std::vector<std::string> validate(const std::string& xmlText,
@@ -58,7 +73,12 @@ public:
   void setLogger(LogCallback cb);
 
 private:
-  TaskHandle submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec);
+  TaskHandle submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
+                        const std::string& packName = {},
+                        const std::string& packVersion = {});
+  TaskHandle submitFromFile(const std::string& xmlPath, TaskSpec spec,
+                            const std::string& packName,
+                            const std::string& packVersion);
   bool validateTask(BT::Tree& tree, const TaskSpec& spec) const;
 
   std::shared_ptr<detail::EngineCore> core_;

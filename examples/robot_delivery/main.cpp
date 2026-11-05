@@ -283,48 +283,7 @@ public:
 // ---------------------------------------------------------------------------
 // 业务树:搜寻段 1 份定义,由 ForEach 按数据驱动 N 次(对比常见的 4 份复制)
 // ---------------------------------------------------------------------------
-static const char* kXml = R"(
-<root BTCPP_format="v4" main_tree_to_execute="pick_and_deliver">
-  <BehaviorTree ID="pick_and_deliver">
-    <Sequence name="deliver_main">
-      <CheckAdapters/>
-      <ResolveItem target_item="{target_item}" prompt="{prompt}" display_name="{display_name}"/>
-      <PlanLocations target_location="{target_location}" locations="{locations}"/>
 
-      <!-- 零复制核心:同一份"导航+检测+确认"逻辑,数据驱动遍历所有候选地点 -->
-      <!-- M2 检查点:搜寻 完成 -> 黑板快照(loc/oid/prompt 等)入 journal -->
-      <Checkpoint id="search_done">
-        <Sequence name="search_block">
-          <ForEach array="{locations}" element="{loc}" continue_on_failure="true">
-            <Sequence name="search_at">
-              <NavigateTo point_id="{loc}"/>
-              <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
-              <RequireFound count="{count}" display_name="{display_name}" loc="{loc}"/>
-            </Sequence>
-          </ForEach>
-          <AssertFound count="{count}" display_name="{display_name}"/>
-        </Sequence>
-      </Checkpoint>
-
-      <Speak text="Found the item. Starting grasp."/>
-
-      <!-- M2 检查点:抓取 完成 -> 递交失败恢复重跑时,搜寻与抓取整体跳过 -->
-      <Checkpoint id="grasp_done">
-        <RetryWithDelay attempts="{grasp_retry}" delay_ms="300">
-          <Sequence>
-            <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
-            <GraspItem object_id="{oid}"/>
-          </Sequence>
-        </RetryWithDelay>
-      </Checkpoint>
-
-      <NavigateTo point_id="handover_point"/>
-      <Speak text="Here is your item, please take it."/>
-      <HandoverItem/>
-      <Speak text="Task completed."/>
-    </Sequence>
-  </BehaviorTree>
-</root>)";
 
 // ---------------------------------------------------------------------------
 // 场景驱动
@@ -349,22 +308,13 @@ static TaskState runDelivery(Engine& engine, MockWorld& world,
   spec.task_type = "DELIVER_ORDER";
   spec.timeout_ms = 60000;  // 任务级超时兜底(策略引擎)
 
-  // schema(M1):加载期校验 —— required 缺失 / 未知字段 / 类型不符
-  // / 树中引用未声明键,全部在提交时拒绝;int 类型按真实类型注入黑板
-  spec.schema = {
-    { "slots", {
-        { "target_item",     { { "type", "string" }, { "required", true } } },
-        { "target_location", { { "type", "string" }, { "required", false } } },
-        { "grasp_retry",     { { "type", "int" },    { "required", false } } },
-    } }
-  };
-
+  // schema/timeout 由 pack 声明(M3):提交时自动合并,无需业务代码重复
   spec.slots["target_item"] = item;
   spec.slots["target_location"] = location;
   spec.slots["grasp_retry"] = graspRetry;
   spec.resume_journal = std::move(resumeJournal);
 
-  auto task = engine.submitFromText(kXml, spec);
+  auto task = engine.submitTask(spec);
   const TaskState state = task.wait();
 
   std::cout << "  state: " << toString(state) << "\n";
@@ -401,6 +351,10 @@ int main() {
   engine.setLogger([](LogLevel, const std::string& msg) {
     std::cout << "  [engine] " << msg << "\n";
   });
+
+  // M3:树包加载即全量校验(树可解析 + schema 数据流);任务按 task_type
+  // 从 pack 解析树文件与默认策略(schema/timeout),不再内嵌 XML
+  engine.loadPack(ROBOT_DELIVERY_PACK_DIR);
 
   // 场景 A:递送水瓶(实际在 shelf_b);shelf_a 未找到被跳过,抓取失败 2 次后挽回
   std::cout << "=== Scenario A: deliver water_bottle (grasp fails twice) ===\n";

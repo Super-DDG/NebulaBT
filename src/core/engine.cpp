@@ -14,13 +14,17 @@
 #include <behaviortree_cpp/decorator_node.h>
 #include <behaviortree_cpp/loggers/abstract_logger.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -112,6 +116,8 @@ private:
 struct TaskContext {
   std::string task_id;
   std::string task_type;
+  std::string pack_name;    // 来源树包(M3;直接提交 XML 时为空)
+  std::string pack_version;
   std::shared_ptr<BT::Tree> tree;
   std::shared_ptr<NodeStatsMap> node_stats = std::make_shared<NodeStatsMap>();
   std::shared_ptr<BT::StatusChangeLogger> trace;  // 声明在 tree 之后:先于树析构
@@ -129,10 +135,23 @@ struct TaskContext {
 };
 
 struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
+  // ---- 树包注册表(M3)----
+  struct PackEntry {
+    PackManifest manifest;
+    std::string dir;  // manifest 所在目录
+  };
+  struct Canary {
+    std::string pack;
+    std::string version;
+    int percent = 0;
+  };
+
   BT::BehaviorTreeFactory factory;
   Scheduler scheduler;
   std::mutex mu;
   std::unordered_map<std::string, std::shared_ptr<TaskContext>> active;
+  std::vector<PackEntry> packs;  // mu_ 保护
+  Canary canary;                 // mu_ 保护
   Engine::FinishedCallback on_finished;  // mu_ 保护
   Engine::JournalSink journal_sink;      // mu_ 保护
   Engine::LogCallback log = [](LogLevel, const std::string& msg) {
@@ -238,6 +257,52 @@ struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
                status == BT::NodeStatus::SUCCESS ? TaskState::Succeeded
                                                  : TaskState::Failed,
                std::string("tree returned ") + BT::toStr(status));
+  }
+
+  // ---- 树包路由(M3)----
+  static std::array<int, 3> parseVersion(const std::string& v) {
+    std::array<int, 3> out{0, 0, 0};
+    std::sscanf(v.c_str(), "%d.%d.%d", &out[0], &out[1], &out[2]);
+    return out;
+  }
+  static bool versionLess(const std::string& a, const std::string& b) {
+    return parseVersion(a) < parseVersion(b);
+  }
+  // FNV-1a:灰度确定性哈希
+  static uint64_t hashId(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char c : s) {
+      h ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+      h *= 1099511628211ull;
+    }
+    return h;
+  }
+
+  // 按 task_type 选 pack 条目:显式版本 > 灰度 > 最高版本
+  const PackEntry* resolveTask(const std::string& taskType,
+                               const std::string& explicitVersion,
+                               const std::string& taskId) {
+    std::lock_guard<std::mutex> lk(mu);
+    const PackEntry* best = nullptr;
+    const PackEntry* canaryHit = nullptr;
+    const PackEntry* pinned = nullptr;
+    for (const auto& p : packs) {
+      if (!p.manifest.tasks.count(taskType)) continue;
+      if (!best || versionLess(best->manifest.version, p.manifest.version)) {
+        best = &p;
+      }
+      if (canary.percent > 0 && canary.pack == p.manifest.name &&
+          canary.version == p.manifest.version &&
+          (hashId(taskId) % 100) < static_cast<uint64_t>(canary.percent)) {
+        canaryHit = &p;
+      }
+      if (!explicitVersion.empty() && p.manifest.version == explicitVersion) {
+        pinned = &p;
+      }
+    }
+    if (pinned) return pinned;
+    if (canaryHit) return canaryHit;
+    return best;
   }
 
   void finishTask(std::shared_ptr<TaskContext> ctx, TaskState st,
@@ -412,15 +477,32 @@ private:
   void initCtx() {
     std::string taskId = "unknown";
     std::string taskType;
+    nlohmann::json inputs = nlohmann::json::object();
     if (auto bb = config().blackboard) {
       bb->get("task_id", taskId);      // bool 版 get,失败保持默认值
       bb->get("task_type", taskType);
+    }
+    // 输入端口快照(激活时刻):{key} 引用解析黑板值,字面量保持 string
+    for (const auto& [port, remap] : config().input_ports) {
+      if (remap.size() >= 3 && remap.front() == '{' && remap.back() == '}') {
+        const std::string key = remap.substr(1, remap.size() - 2);
+        if (auto bb = config().blackboard) {
+          if (auto entry = bb->getAnyLocked(key)) {
+            inputs[port] = nebulabt::anyToJson(entry);
+            continue;
+          }
+        }
+        inputs[port] = nullptr;  // 引用的黑板键尚无值
+      } else {
+        inputs[port] = remap;    // 字面量
+      }
     }
     task_id_ = taskId;
     // 直接 new(NebulaCtx 构造私有,friend 本类;make_unique 的实例化
     // 上下文不继承 friend 权限,不能用于私有构造)
     ctx_.reset(new NebulaCtx(*this, core_->findFailures(taskId),
                              std::move(taskId), std::move(taskType)));
+    ctx_->inputs_ = std::move(inputs);
   }
 
   Done makeDone() {
@@ -697,6 +779,12 @@ TaskHandle Engine::submitFromText(const std::string& xmlText, TaskSpec spec) {
 }
 
 TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec) {
+  return submitFromFile(xmlPath, std::move(spec), "", "");
+}
+
+TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec,
+                                  const std::string& packName,
+                                  const std::string& packVersion) {
   if (spec.task_id.empty()) {
     spec.task_id = detail::generateTaskId();
   }
@@ -711,7 +799,96 @@ TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec) {
   if (!validateTask(*tree, spec)) {
     return TaskHandle();
   }
-  return submitTree(std::move(tree), std::move(spec));
+  return submitTree(std::move(tree), std::move(spec), packName, packVersion);
+}
+
+void Engine::loadPack(const std::string& manifestDir) {
+  const std::string manifestPath = manifestDir + "/pack.json";
+  std::ifstream f(manifestPath);
+  if (!f) {
+    throw std::runtime_error("loadPack: cannot read " + manifestPath);
+  }
+  nlohmann::json j;
+  try {
+    f >> j;
+  } catch (const std::exception& e) {
+    throw std::runtime_error("loadPack: manifest parse: " +
+                             std::string(e.what()));
+  }
+  auto manifest = parsePackManifest(j);
+
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    for (const auto& p : core_->packs) {
+      if (p.manifest.name == manifest.name &&
+          p.manifest.version == manifest.version) {
+        throw std::runtime_error("loadPack: pack '" + manifest.name + "' v" +
+                                 manifest.version + " already loaded");
+      }
+    }
+  }
+
+  // 加载即校验:每棵树可解析、schema 数据流通过——CI 加载全部 pack 即门禁
+  for (const auto& [taskType, task] : manifest.tasks) {
+    const std::string path = manifestDir + "/" + manifest.trees_dir + "/" +
+                             task.tree + ".xml";
+    std::shared_ptr<BT::Tree> tree;
+    try {
+      tree = std::make_shared<BT::Tree>(core_->factory.createTreeFromFile(path));
+    } catch (const std::exception& e) {
+      throw std::runtime_error("loadPack[" + manifest.name + " v" +
+                               manifest.version + "] task '" + taskType +
+                               "': " + e.what());
+    }
+    std::vector<std::string> errors;
+    const auto defs = parseSlotSchema(task.schema, errors);
+    detail::validateTreeKeys(*tree, defs, errors);
+    if (!errors.empty()) {
+      std::string joined;
+      for (const auto& e : errors) joined += "\n  - " + e;
+      throw std::runtime_error("loadPack[" + manifest.name + " v" +
+                               manifest.version + "] task '" + taskType +
+                               "':" + joined);
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    core_->packs.push_back(detail::EngineCore::PackEntry{
+        std::move(manifest), manifestDir});
+  }
+  core_->logf(LogLevel::Info, "pack loaded (see journal for details)");
+}
+
+TaskHandle Engine::submitTask(TaskSpec spec) {
+  if (spec.task_id.empty()) {
+    spec.task_id = detail::generateTaskId();
+  }
+  const detail::EngineCore::PackEntry* entry =
+      core_->resolveTask(spec.task_type, spec.pack_version, spec.task_id);
+  if (!entry) {
+    core_->logf(LogLevel::Error,
+                "submitTask: no loaded pack provides task_type '" +
+                    spec.task_type + "'");
+    return TaskHandle();
+  }
+  const auto& task = entry->manifest.tasks.at(spec.task_type);
+  if (spec.schema.empty()) {
+    spec.schema = task.schema;
+  }
+  if (spec.timeout_ms == 0) {
+    spec.timeout_ms = task.timeout_ms;
+  }
+  const std::string path = entry->dir + "/" + entry->manifest.trees_dir +
+                           "/" + task.tree + ".xml";
+  return submitFromFile(path, std::move(spec), entry->manifest.name,
+                        entry->manifest.version);
+}
+
+void Engine::setCanary(const std::string& packName, const std::string& version,
+                       int percent) {
+  std::lock_guard<std::mutex> lk(core_->mu);
+  core_->canary = {packName, version, percent};
 }
 
 bool Engine::validateTask(BT::Tree& tree, const TaskSpec& spec) const {
@@ -748,13 +925,17 @@ std::vector<std::string> Engine::validate(const std::string& xmlText,
   return errors;
 }
 
-TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
+TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
+                              const std::string& packName,
+                              const std::string& packVersion) {
   std::vector<std::string> parseErrors;  // schema 格式问题已在 validateTask 上报
   const auto defs = parseSlotSchema(spec.schema, parseErrors);
   detail::injectSlots(*tree, spec, defs);
   auto ctx = std::make_shared<detail::TaskContext>();
   ctx->task_id = spec.task_id;
   ctx->task_type = spec.task_type;
+  ctx->pack_name = packName;
+  ctx->pack_version = packVersion;
   ctx->tree = tree;
   // 节点计时:订阅全树状态迁移(相对任务提交时刻)
   ctx->trace = std::make_shared<detail::TaskTraceLogger>(tree->rootNode(),
@@ -784,10 +965,13 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec) {
   }
   TaskHandle handle(ctx, core_);
   core_->appendJournal(
-      ctx, "submitted", nlohmann::json{{"task_type", spec.task_type},
-                                       {"resumed",
-                                        spec.resume_journal.is_array() &&
-                                            !spec.resume_journal.empty()}});
+      ctx, "submitted",
+      nlohmann::json{{"task_type", spec.task_type},
+                     {"pack", packName},
+                     {"pack_version", packVersion},
+                     {"resumed",
+                      spec.resume_journal.is_array() &&
+                          !spec.resume_journal.empty()}});
   auto core = core_;
   auto id = spec.task_id;
   core_->scheduler.post([core, id] { core->tickTask(id); });
@@ -892,6 +1076,10 @@ nlohmann::json TaskHandle::explain() const {
   nlohmann::json j;
   j["task_id"] = ctx_->task_id;
   j["task_type"] = ctx_->task_type;
+  if (!ctx_->pack_name.empty()) {
+    j["pack"] = ctx_->pack_name;
+    j["pack_version"] = ctx_->pack_version;
+  }
   j["state"] = toString(ctx_->state.load());
   if (ctx_->tree && ctx_->tree->rootNode()) {
     j["tree"] = detail::walkNode(ctx_->tree->rootNode(), "",

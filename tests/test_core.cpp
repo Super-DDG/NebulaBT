@@ -4,11 +4,14 @@
 #include <nebulabt/core/engine.hpp>
 #include <nebulabt/core/scheduler.hpp>
 #include <nebulabt/sdk/action.hpp>
+#include <nebulabt/testkit/mock.hpp>
 
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 
 using namespace nebulabt;
@@ -18,6 +21,17 @@ using BT::NodeStatus;
   do {                                                                         \
     if (!(cond)) {                                                             \
       std::cerr << "CHECK failed: " #cond " (line " << __LINE__ << ")\n";     \
+      std::exit(1);                                                            \
+    }                                                                          \
+  } while (0)
+
+#define CHECK_NOTHROW(stmt)                                                    \
+  do {                                                                         \
+    try {                                                                      \
+      stmt;                                                                    \
+    } catch (const std::exception& e) {                                        \
+      std::cerr << "CHECK_NOTHROW failed: " << e.what() << " (line "          \
+                << __LINE__ << ")\n";                                          \
       std::exit(1);                                                            \
     }                                                                          \
   } while (0)
@@ -695,6 +709,122 @@ static void test_explain_timing() {
   CHECK(tree["children"][1]["attempts"].get<int>() == 1);  // 同步 Ok
 }
 
+// ---------------------------------------------------------------------------
+// M3:树包 / 灰度 / 测试替身
+// ---------------------------------------------------------------------------
+
+#include <sys/stat.h>
+
+static void writePack(const std::string& dir, const std::string& name,
+                      const std::string& version,
+                      const std::string& treeBody) {
+  // mkdir 不递归:先建父目录,再建子目录
+  mkdir("/tmp/nebulabt_pack_test", 0755);
+  mkdir(dir.c_str(), 0755);
+  const std::string treesDir = dir + "/trees";
+  mkdir(treesDir.c_str(), 0755);
+  std::ofstream(dir + "/pack.json")
+      << "{\"name\":\"" << name << "\",\"version\":\"" << version
+      << "\",\"task_types\":{\"M3_TASK\":{"
+      << "\"tree\":\"m3_tree\","
+      << "\"schema\":{\"slots\":{\"n\":{\"type\":\"int\",\"required\":true}}}}}}";
+  std::ofstream(treesDir + "/m3_tree.xml") << treeBody;
+}
+
+// 按黑板 n 的奇偶决定成败(用于区分两个版本的行为)
+class ParityAction : public NebulaAction {
+public:
+  BT::PortsList providedPorts() const override {
+    return { BT::InputPort<int>("n"), BT::OutputPort<std::string>("which") };
+  }
+  BT::NodeStatus start(NebulaCtx& ctx, const Done&) override {
+    const int n = ctx.in<int>("n", 0);
+    ctx.out("which", (n % 2 == 0) ? "even" : "odd");
+    return BT::NodeStatus::SUCCESS;
+  }
+};
+
+static void test_pack_and_canary() {
+  const std::string base = "/tmp/nebulabt_pack_test";
+  // 稳定版 1.0.0:读 n,输出 even 分支内容;金丝雀 2.0.0:odd 分支内容
+  writePack(base + "/v1", "m3pack", "1.0.0", R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <ParityAction n="{n}" which="{which}"/>
+    </BehaviorTree></root>)");
+  writePack(base + "/v2", "m3pack", "2.0.0", R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <ParityAction n="{n}" which="{which}"/>
+    </BehaviorTree></root>)");
+
+  Engine engine;
+  engine.registerAction("ParityAction", std::make_shared<ParityAction>());
+  CHECK_NOTHROW(engine.loadPack(base + "/v1"));
+  CHECK_NOTHROW(engine.loadPack(base + "/v2"));
+
+  // 显式钉住 1.0.0
+  TaskSpec spec;
+  spec.task_type = "M3_TASK";
+  spec.pack_version = "1.0.0";
+  spec.slots["n"] = 4;
+  auto t1 = engine.submitTask(spec);
+  CHECK(!t1.empty());
+  CHECK(t1.wait() == TaskState::Succeeded);
+  CHECK(t1.explain()["pack_version"] == "1.0.0");
+
+  // 灰度 100% -> 全部路由到 2.0.0
+  engine.setCanary("m3pack", "2.0.0", 100);
+  TaskSpec spec2;
+  spec2.task_type = "M3_TASK";
+  spec2.slots["n"] = 4;
+  auto t2 = engine.submitTask(spec2);
+  CHECK(!t2.empty());
+  CHECK(t2.wait() == TaskState::Succeeded);
+  CHECK(t2.explain()["pack_version"] == "2.0.0");
+
+  // 灰度 0% -> 回到最高版本(2.0.0 仍是最高版本,显式对比:钉 1.0.0)
+  engine.setCanary("m3pack", "2.0.0", 0);
+  TaskSpec spec3;
+  spec3.task_type = "M3_TASK";
+  spec3.slots["n"] = 4;
+  spec3.pack_version = "1.0.0";
+  CHECK(engine.submitTask(spec3).explain()["pack_version"] == "1.0.0");
+
+  // 重复加载同版本 -> 抛异常
+  bool threw = false;
+  try {
+    engine.loadPack(base + "/v1");
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
+static void test_scripted_mock() {
+  using nebulabt::testkit::ScriptedAction;
+  Engine engine;
+  auto nav = std::make_shared<ScriptedAction>(BT::PortsList{
+      BT::InputPort<std::string>("point_id")});
+  nav->thenFail("NAV_TIMEOUT", "no route")
+      .then(BT::NodeStatus::SUCCESS, {{"arrived", true}});
+  engine.registerAction("Nav", nav);
+
+  static const char* kXml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <RetryWithDelay attempts="3" delay_ms="10">
+        <Nav point_id="{loc}"/>
+      </RetryWithDelay>
+    </BehaviorTree></root>)";
+  TaskSpec spec;
+  spec.slots["loc"] = "kitchen";
+  auto task = engine.submitFromText(kXml, spec);
+  CHECK(task.wait() == TaskState::Succeeded);  // 第 1 次失败,第 2 次成功
+
+  const auto calls = nav->calls();
+  CHECK(calls.size() == 2);
+  CHECK(calls[0]["point_id"] == "kitchen");   // 输入快照被录制
+  CHECK(calls[1]["point_id"] == "kitchen");
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -732,6 +862,10 @@ int main() {
   std::cout << "ok  checkpoint resume across engines\n";
   test_explain_timing();
   std::cout << "ok  explain timing\n";
+  test_pack_and_canary();
+  std::cout << "ok  pack loading + canary routing\n";
+  test_scripted_mock();
+  std::cout << "ok  scripted mock\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

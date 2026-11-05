@@ -145,18 +145,33 @@ BT.CPP 无法快照"哪个节点正在 RUNNING"(那是 C++ 调用栈状态)。�
 不做"树中间任意位置断点续跑"。规划:checkpoint 的原子落盘(配 WAL)、
 resume 时的树版本一致性校验。
 
-### 4.8 树包与版本(M3)
+### 4.8 树包与版本(已实现,M3 核心)
 
-树是带版本的业务资产:模板树 + 实例覆写(变体不 fork);树包可被引用(`requires: deliver_pack >= 2.1`);任务级灰度路由。
+树是带版本的业务资产。pack = 目录(pack.json 清单 + trees/*.xml):
+
+- **loadPack(目录)**:加载即全量校验——每棵树可解析、schema 数据流检查通过,
+  失败抛异常;CI 中加载全部 pack 就是最强门禁
+- **submitTask(spec)**:按 task_type 从 pack 解析树文件;schema/timeout_ms
+  由 pack 声明,业务代码不再重复;explain/journal 记录来源 pack 版本
+- **灰度路由 setCanary(pack, version, percent)**:task_id 哈希确定性路由,
+  percent 命中走 canary 版本,其余走最高版本;`TaskSpec.pack_version`
+  显式钉住(恢复重跑必须钉住原版本)
+- 同名同版本重复加载抛异常;模板树+实例覆写与 `requires` 引用为后续演进
+
+### 4.10 测试替身(M3)
+
+`testkit::ScriptedAction`:按脚本返回(`then / thenFail / always`),
+自动录制每次激活的输入端口快照(`calls()`,经 `NebulaCtx::inputsJson()`)。
+与 RetryWithDelay/Checkpoint 组合覆盖金路径、失败兜底、恢复重跑——全部 CI 内完成。
 
 ### 4.9 `nebula` CLI(部分实现)
 
 ```
 nebula validate <tree.xml> [schema.json]   # 加载期校验,CI 门禁(M1)
-nebula journal  <file.jsonl>               # 检查持久化 journal:事件分布、
-                                           # 任务终态、检查点清单(恢复前排查)
+nebula journal  <file.jsonl>               # 持久化 journal 排查(M2)
+nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 ```
-规划:explain / replay / doc(见路线图)。
+规划:explain / replay。
 
 ## 5. 路线图 {#roadmap}
 
@@ -166,7 +181,8 @@ nebula journal  <file.jsonl>               # 检查持久化 journal:事件分�
 | **M1 ✅** | 类型化 schema 校验(L1+L2)✅;策略(超时 ✅ / RetryWithDelay ✅ / 墙钟预算 ✅);失败自动捕获 ✅;`nebula validate` CLI ✅ | **试金石通过**:`examples/robot_delivery` 演示典型"拣选-递送"业务,搜寻段 N 份复制 → 1 份数据驱动,全树在 schema 严格模式下自洽 |
 | **M2(核心已达成)** | journal 事件日志 ✅;Checkpoint 装饰器 ✅;断点恢复(含跨进程)✅;动态树原语补齐(WhileLoop/SwitchN)✅ | 恢复演示:递交失败重跑,已完成段整体跳过、副作用不重复 |
 | **M2 ✅** | explain 完整版(节点 attempts / running_ms)✅;**kill -9 实机恢复测试** ✅(fork 子进程真杀 + journal 落盘 + 新进程恢复);`nebula journal` CLI ✅ | tests/kill9:检查点先落盘 → SIGKILL → 新进程恢复,副作用零重复 |
-| M3 | 树包版本化与灰度路由;Mock 自动生成;自动流程文档 | 1.0 发布 |
+| **M3(核心已达成)** | 树包版本化(loadPack 加载即校验)✅;灰度路由 setCanary ✅;ScriptedAction 测试替身 ✅;`nebula doc` 自动流程图 ✅;robot_delivery 升级为 pack 工作流 ✅ | 20 组单测;pack 双版本灰度路由断言 |
+| M3 收尾 | 模板树+实例覆写;`requires` 引用;explain/replay CLI;1.0 发布(README 定稿/贡献指南) | 社区发布清单 |
 
 ## 6. 已知限制
 

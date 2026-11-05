@@ -47,6 +47,7 @@ endif()
 add_library(nebulabt
   src/core/failure.cpp
   src/core/journal.cpp
+  src/core/pack.cpp
   src/core/scheduler.cpp
   src/core/schema.cpp
   src/core/engine.cpp

@@ -13,6 +13,8 @@
 #include <nebulabt/core/engine.hpp>
 #include <nebulabt/core/journal.hpp>
 
+#include <tinyxml2.h>
+
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -136,12 +138,70 @@ static int cmdJournal(int argc, char** argv) {
   return bad == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// nebula doc <tree.xml>:树 -> mermaid flowchart(自动流程文档)
+// 只依赖 XML 结构,不要求节点已注册——评审/交接时给树"拍快照"。
+// ---------------------------------------------------------------------------
+static void docWalk(tinyxml2::XMLElement* el, const std::string& parentVar,
+                    int* counter, std::ostringstream* out) {
+  const std::string var = "n" + std::to_string((*counter)++);
+  std::string label = el->Name();
+  if (const char* name = el->Attribute("name")) {
+    label += " : ";
+    label += name;
+  }
+  // 转义 mermaid 标签中的引号与方括号
+  for (auto& ch : label) {
+    if (ch == '"' || ch == '[' || ch == ']') ch = '\'';
+  }
+  *out << "  " << var << "[\"" << label << "\"]\n";
+  if (!parentVar.empty()) {
+    *out << "  " << parentVar << " --> " << var << "\n";
+  }
+  for (tinyxml2::XMLElement* child = el->FirstChildElement(); child;
+       child = child->NextSiblingElement()) {
+    docWalk(child, var, counter, out);
+  }
+}
+
+static int cmdDoc(int argc, char** argv) {
+  if (argc < 3) {
+    std::cerr << "usage: nebula doc <tree.xml>\n";
+    return 2;
+  }
+  tinyxml2::XMLDocument doc;
+  if (doc.LoadFile(argv[2]) != tinyxml2::XML_SUCCESS) {
+    std::cerr << "error: " << doc.ErrorStr() << "\n";
+    return 2;
+  }
+  tinyxml2::XMLElement* root = doc.RootElement();
+  if (!root) {
+    std::cerr << "error: empty xml\n";
+    return 2;
+  }
+  tinyxml2::XMLElement* bt = root->FirstChildElement("BehaviorTree");
+  if (!bt) {
+    std::cerr << "error: no <BehaviorTree> element\n";
+    return 2;
+  }
+  std::ostringstream out;
+  out << "flowchart TD\n";
+  int counter = 0;
+  for (tinyxml2::XMLElement* top = bt->FirstChildElement(); top;
+       top = top->NextSiblingElement()) {
+    docWalk(top, "", &counter, &out);
+  }
+  std::cout << out.str();
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: nebula <command> [args]\n"
               << "commands:\n"
               << "  validate <tree.xml> [schema.json]\n"
-              << "  journal  <file.jsonl>\n";
+              << "  journal  <file.jsonl>\n"
+              << "  doc      <tree.xml>\n";
     return 2;
   }
   const std::string cmd = argv[1];
@@ -150,6 +210,9 @@ int main(int argc, char** argv) {
   }
   if (cmd == "journal") {
     return cmdJournal(argc, argv);
+  }
+  if (cmd == "doc") {
+    return cmdDoc(argc, argv);
   }
   std::cerr << "error: unknown command '" << cmd << "'\n";
   return 2;

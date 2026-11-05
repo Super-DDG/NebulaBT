@@ -1,0 +1,42 @@
+
+<root BTCPP_format="v4" main_tree_to_execute="pick_and_deliver">
+  <BehaviorTree ID="pick_and_deliver">
+    <Sequence name="deliver_main">
+      <CheckAdapters/>
+      <ResolveItem target_item="{target_item}" prompt="{prompt}" display_name="{display_name}"/>
+      <PlanLocations target_location="{target_location}" locations="{locations}"/>
+
+      <!-- 零复制核心:同一份"导航+检测+确认"逻辑,数据驱动遍历所有候选地点 -->
+      <!-- M2 检查点:搜寻 完成 -> 黑板快照(loc/oid/prompt 等)入 journal -->
+      <Checkpoint id="search_done">
+        <Sequence name="search_block">
+          <ForEach array="{locations}" element="{loc}" continue_on_failure="true">
+            <Sequence name="search_at">
+              <NavigateTo point_id="{loc}"/>
+              <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
+              <RequireFound count="{count}" display_name="{display_name}" loc="{loc}"/>
+            </Sequence>
+          </ForEach>
+          <AssertFound count="{count}" display_name="{display_name}"/>
+        </Sequence>
+      </Checkpoint>
+
+      <Speak text="Found the item. Starting grasp."/>
+
+      <!-- M2 检查点:抓取 完成 -> 递交失败恢复重跑时,搜寻与抓取整体跳过 -->
+      <Checkpoint id="grasp_done">
+        <RetryWithDelay attempts="{grasp_retry}" delay_ms="300">
+          <Sequence>
+            <DetectItem loc="{loc}" prompt="{prompt}" count="{count}" first_id="{oid}"/>
+            <GraspItem object_id="{oid}"/>
+          </Sequence>
+        </RetryWithDelay>
+      </Checkpoint>
+
+      <NavigateTo point_id="handover_point"/>
+      <Speak text="Here is your item, please take it."/>
+      <HandoverItem/>
+      <Speak text="Task completed."/>
+    </Sequence>
+  </BehaviorTree>
+</root>

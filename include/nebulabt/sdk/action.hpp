@@ -9,6 +9,7 @@
 /// - halt:取消/树被 halt 时回调,应当取消在途工作
 /// 节点作者全程不感知 tick、线程与轮询。
 
+#include "nebulabt/core/any_json.hpp"
 #include "nebulabt/core/failure.hpp"
 #include <behaviortree_cpp/action_node.h>
 #include <behaviortree_cpp/bt_factory.h>
@@ -52,6 +53,10 @@ public:
   /// 记录一条结构化失败(建议在返回 FAILURE 前调用)
   void fail(std::string code, std::string message);
 
+  /// 输入端口快照(激活时刻):{key} 引用解析为黑板值(Any 类型分发),
+  /// 字面量保持 string。用途:mock 调用录制、业务日志、调试。
+  nlohmann::json inputsJson() const { return inputs_; }
+
   const std::string& taskId() const { return task_id_; }
   const std::string& taskType() const { return task_type_; }
 
@@ -64,6 +69,7 @@ private:
   std::shared_ptr<FailureLog> failures_;
   std::string task_id_;
   std::string task_type_;
+  nlohmann::json inputs_ = nlohmann::json::object();  // 激活时的输入快照
 };
 
 /// 业务动作基类

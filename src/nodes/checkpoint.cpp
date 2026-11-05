@@ -1,5 +1,7 @@
 #include "nebulabt/nodes/checkpoint.hpp"
 
+#include "nebulabt/core/any_json.hpp"
+
 #include <behaviortree_cpp/blackboard.h>
 #include <set>
 #include <vector>
@@ -44,25 +46,11 @@ nlohmann::json CheckpointNode::captureSnapshot() const {
     if (!entry) {
       continue;
     }
-    const std::type_index t = entry->type();
-    try {
-      if (t == typeid(std::string)) {
-        snapshot[key] = entry->cast<std::string>();
-      } else if (t == typeid(int)) {
-        snapshot[key] = entry->cast<int>();
-      } else if (t == typeid(int64_t)) {
-        snapshot[key] = entry->cast<int64_t>();
-      } else if (t == typeid(double)) {
-        snapshot[key] = entry->cast<double>();
-      } else if (t == typeid(bool)) {
-        snapshot[key] = entry->cast<bool>();
-      } else if (t == typeid(std::vector<std::string>)) {
-        snapshot[key] = entry->cast<std::vector<std::string>>();
-      }
-      // 其它类型 v0 跳过(见头文件已知限制)
-    } catch (const std::exception&) {
-      // 单键序列化失败不影响其余快照
+    const nlohmann::json v = nebulabt::anyToJson(entry);
+    if (!v.is_null()) {
+      snapshot[key] = v;
     }
+    // 其它类型 v0 跳过(见头文件已知限制)
   }
   return snapshot;
 }

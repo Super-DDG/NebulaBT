@@ -42,6 +42,9 @@ struct TaskSpec {
   /// 或 journal sink 落盘后的数组)。提交同一棵树时,已完成的 Checkpoint
   /// 跳过子节点并恢复黑板——上一轮已提交的副作用不重复执行。
   nlohmann::json resume_journal = nlohmann::json::array();
+  /// 树包版本显式钉住(M3,可选):非空时路由到指定 pack 版本,
+  /// 忽略灰度策略(恢复重跑必须与原版本一致,恢复路径内部使用)
+  std::string pack_version;
 };
 
 /// 任务句柄
