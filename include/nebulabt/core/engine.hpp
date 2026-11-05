@@ -9,6 +9,7 @@
 ///   task.wait();
 ///   task.explain();
 
+#include "nebulabt/core/clock.hpp"
 #include "nebulabt/core/pack.hpp"
 #include "nebulabt/core/task.hpp"
 #include "nebulabt/sdk/action.hpp"
@@ -24,6 +25,17 @@ namespace nebulabt {
 
 enum class LogLevel { Info, Warn, Error };
 
+/// 引擎资源上限(M4):0 = 不限。嵌入式/长期运行服务建议显式设置,
+/// 防止失控的任务/回调无界增长吃掉内存
+struct EngineLimits {
+  /// 同时运行(含排队)的最大任务数;超限提交被拒绝并返回空句柄
+  size_t max_active_tasks = 0;
+  /// scheduler 作业队列上限;超限投递被拒绝并告警
+  size_t max_pending_jobs = 0;
+  /// 未触发定时器上限;超限投递被拒绝并告警
+  size_t max_pending_timers = 0;
+};
+
 class Engine {
 public:
   /// 任务终态回调(在调度线程执行,应当快速返回)
@@ -31,8 +43,13 @@ public:
   using LogCallback = std::function<void(LogLevel, const std::string&)>;
   /// journal 事件回调(调度线程执行;持久化即在此落盘,每事件一行 JSON)
   using JournalSink = std::function<void(const JournalEvent&)>;
+  /// watchdog 触发回调(调度线程执行):task_id + 无节点迁移的静默毫秒数
+  using WatchdogCallback =
+      std::function<void(const std::string& task_id, uint64_t quiet_ms)>;
 
-  Engine();
+  /// vclock 非空 = 虚拟时钟模式(M6):超时/重试延时/watchdog 均随
+  /// advanceTime() 推进而触发,测试零真实等待。默认真实时钟。
+  explicit Engine(std::shared_ptr<VirtualClock> vclock = {});
   ~Engine();
   Engine(const Engine&) = delete;
   Engine& operator=(const Engine&) = delete;
@@ -71,6 +88,21 @@ public:
 
   /// 日志回调(默认输出到 stderr)
   void setLogger(LogCallback cb);
+
+  /// 资源上限(M4)。可在任意时刻调用;建议引擎创建后立即设置
+  void setLimits(const EngineLimits& limits);
+
+  /// 仅虚拟时钟模式:推进虚拟时间 ms,到期定时器(超时/重试延时/
+  /// watchdog 巡检)随即在调度线程触发。真实时钟模式无效并告警。
+  void advanceTime(uint64_t ms);
+
+  /// 任务 watchdog(M4):任务 RUNNING 期间超过 interval 毫秒无任何节点
+  /// 状态迁移 → 触发回调并告警;halt_on_trigger 时同时 halt 整棵树、
+  /// 记录 TASK_WATCHDOG 失败并终态 FAILED。
+  /// interval = 0 关闭(默认)。TaskSpec.watchdog_ms > 0 可按任务覆盖。
+  /// 嵌入式防"任务悄悄卡死":崩溃可恢复,卡死必须可发现。
+  void setWatchdog(std::chrono::milliseconds interval, bool halt_on_trigger,
+                   WatchdogCallback cb = {});
 
 private:
   TaskHandle submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,

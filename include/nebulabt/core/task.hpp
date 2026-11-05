@@ -39,6 +39,10 @@ struct TaskSpec {
   /// 任务级超时(毫秒,0 = 不限制)。超时触发:halt 整棵树 +
   /// 记录 TASK_TIMEOUT 失败 + 终态 FAILED(策略引擎 M1 的第一块)
   uint64_t timeout_ms = 0;
+  /// 任务 watchdog(毫秒,M4):RUNNING 期间静默(无节点状态迁移)超过
+  /// 该值触发 Engine::setWatchdog 的回调;> 0 时覆盖引擎默认值,
+  /// 是否 halt 由引擎的 halt_on_trigger 决定。0 = 跟随引擎默认
+  uint64_t watchdog_ms = 0;
   /// 断点恢复(M2,可选):上一轮任务的事件日志(TaskHandle::journal()
   /// 或 journal sink 落盘后的数组)。提交同一棵树时,已完成的 Checkpoint
   /// 跳过子节点并恢复黑板——上一轮已提交的副作用不重复执行。
@@ -46,6 +50,14 @@ struct TaskSpec {
   /// 树包版本显式钉住(M3,可选):非空时路由到指定 pack 版本,
   /// 忽略灰度策略(恢复重跑必须与原版本一致,恢复路径内部使用)
   std::string pack_version;
+  /// 资源仲裁(M5,可选):任务声明占用的互斥资源(如 "gripper","bin_3")。
+  /// 与任一活动任务的声明集有交集 → 提交被拒绝(返回空句柄);
+  /// 任务终态时自动释放。单进程内的任务级互斥,防"两个任务同时抓同一包裹"
+  std::vector<std::string> resources;
+  /// Groot2 实时可视化端口(M7,可选;0 = 关闭):该任务运行期间向
+  /// Groot2 GUI 实时推送节点状态(BT.CPP 自带 publisher)。
+  /// 每个运行中任务需独立端口;端口被占用时告警并继续(不影响执行)
+  uint16_t groot2_port = 0;
 };
 
 /// 任务句柄

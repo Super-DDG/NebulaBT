@@ -3,6 +3,91 @@
 All notable changes to NebulaBT are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased] - M7 可观测与便携
+
+### Added
+
+- **Groot2 实时可视化**:`TaskSpec.groot2_port` — 任务运行期间向 Groot2
+  GUI 实时推送全树节点状态(BT.CPP 自带 publisher,引擎零改动集成);
+  端口占用仅告警不影响执行。
+- **运行中 explain**:`explain()` 在任务 RUNNING 时安全可用——树遍历
+  改为向调度线程投递快照 job(消除与 tick 并发读树的不安全窗口);
+  终态后仍走直接遍历。排障恰好在任务卡住时最需要 explain。
+- **树嵌入二进制**:`nebulabt_embed_trees()` CMake 函数(随安装包分发,
+  `lib/cmake/nebulabt/nebulabt-embed.cmake`)— 构建期把 XML 转成字符串
+  常量头,无文件系统的 MCU / 现场防树文件被改坏;`test_embed` 验证。
+- **失败自动富化**:`FailureRecord.inputs` — `ctx.fail()` 自动附带激活
+  时刻的输入端口快照({key} 已解析为黑板值),排障不用猜"当时参数"。
+- 库尺寸基准:nebulabt 自身 ~1.26 MB text(Release,未 strip);
+  全量组件化裁剪推迟到有真实 MCU 目标后再评估。
+
+## [Unreleased] - M6 确定性内核与回放
+
+### Added
+
+- **时钟注入**:`Engine(std::shared_ptr<VirtualClock>)` — 超时 / 重试延时 /
+  watchdog 静默计算 / 活动戳统一走 `NebulaClock`;`Engine::advanceTime(ms)`
+  推进虚拟时间并把到期定时器**物化为调度作业**(单线程 tick 模型不变,
+  两相推进:先在旧时刻排空既有作业,再触发到期定时器)。测试中重试 /
+  超时 / 看门狗场景零真实等待。真实时钟引擎调用 advanceTime 仅告警。
+- **故障注入 kit**:`testkit::flaky(action, fail_first, code, msg)` —
+  注册层包装,生产动作代码零改动;计数跨 Engine 存活,可模拟故障
+  横跨多轮恢复。
+- **恢复性质测试 harness**(新测试二进制 `nebulabt_property`):200 轮
+  随机推进 × 随机 done 完成时机 × 随机崩溃(引擎析构)× 恢复重跑,
+  每轮断言"已记录检查点的副作用绝不再执行、未完成段至多一次、
+  最终成功轮未完成段恰好一次";journal 走帧格式持久化(与生产路径
+  完全一致)。kill9 的单点验证泛化为性质测试。
+- **`nebula replay <journal-file> [--until N]` CLI**:恢复态预演——
+  哪些检查点会被跳过、恢复哪些黑板键、上次运行终态;纯 journal 分析,
+  不执行树。`nebula journal` / `explain` 同步支持帧格式自适应读取。
+
+### Fixed
+
+- watchdog 测试中 `RetryWithDelay` 端口名笔误(`num_attempts` →
+  `attempts`)导致该用例此前空跑通过。
+
+## [Unreleased] - M5 韧性原语
+
+### Added
+
+- **Compensable(Saga 补偿)**:双子控制节点 `[主工作, 补偿子树]`,主工作
+  SUCCESS 即"武装";任务终态 FAILED 时引擎**自动逆序执行**全部已武装
+  补偿(超时/路径同)——"扣了 A、B 失败,忘补偿 A"在结构上不可能发生。
+  补偿失败记 `COMPENSATION_FAILED` 并继续逆序;journal 记
+  compensation_armed/started/done。SUCCEEDED/CANCELED 不触发补偿。
+- **ReactiveGuard(运行期守护)**:`while_true` 黑板 bool 键运行期巡检
+  (调度器定时驱动,非业务轮询);破坏即 halt 子树 + 记
+  `GUARD_VIOLATED` + 守护节点 FAILURE(父层走恢复分支)。键缺失/类型
+  不符 **fail-closed**;适用安全区/e-stop/电量等"子树只能在条件成立时
+  运行"的机器人刚需。
+- **资源仲裁**:`TaskSpec.resources` 声明互斥资源,与活动任务声明集
+  有交集 → 提交拒绝(终态自动释放)。单进程任务级互斥,防"两个任务
+  同时抓同一包裹"。
+- order_fulfillment 示例:手写补偿分支删除,改为 Compensable 声明式。
+
+## [Unreleased] - M4 稳定地基
+
+### Added
+
+- **Journal 掉电安全**:帧格式持久化 `[u32 len][u32 crc32][payload]`
+  (`JournalFileWriter`,可选每事件 fsync);容错读取 `readJournalFile` —
+  截断尾帧 / CRC 不符时保留完好前缀并标记 `torn_tail`,不再整文件报废。
+  kill -9 测试升级:落盘走帧格式,并注入撕裂尾帧验证恢复侧。
+- **资源上限**:`Engine::setLimits(EngineLimits)` — 最大活动任务数
+  (超限提交拒绝)、scheduler 队列与定时器上限(超限投递拒绝并告警),
+  防失控回调风暴无界增长。
+- **任务 watchdog**:`Engine::setWatchdog(interval, halt_on_trigger, cb)`
+  — 任务 RUNNING 静默(无节点状态迁移)超限即告警,可选 halt +
+  `TASK_WATCHDOG` 终态;`TaskSpec.watchdog_ms` 按任务覆盖;同一静默期
+  只触发一次,活动恢复自动重新武装。
+
+### Changed
+
+- **engine.cpp 拆分**(1168 行 → 7 个文件):`engine_core` / `bridge_node` /
+  `task_context` / `node_stats` / `tree_check` / `task` / `nebula_ctx`,
+  为后续里程碑铺路。公共 API 无变化。
+
 ## [1.0.0] - 2026-11-05
 
 First tagged release. Core feature set complete and covered by 21 test cases

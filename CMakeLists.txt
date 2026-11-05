@@ -12,6 +12,9 @@ option(NEBULABT_BUILD_EXAMPLES "Build NebulaBT examples" ON)
 option(NEBULABT_BUILD_TESTS "Build NebulaBT tests" ON)
 option(NEBULABT_BUILD_TOOLS "Build the nebula CLI" ON)
 
+# 树嵌入(M7):nebulabt_embed_trees() 随安装包分发,下游可 include
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
 # BehaviorTree.CPP: system package first, then local source, then git fetch.
 set(NEBULABT_BT_CPP_SOURCE_DIR "" CACHE PATH
     "Local BehaviorTree.CPP source directory (skips find_package and git fetch)")
@@ -50,12 +53,21 @@ endif()
 add_library(nebulabt
   src/core/failure.cpp
   src/core/journal.cpp
+  src/core/journal_file.cpp
   src/core/pack.cpp
   src/core/scheduler.cpp
   src/core/schema.cpp
   src/core/engine.cpp
+  src/core/engine_core.cpp
+  src/core/bridge_node.cpp
+  src/core/node_stats.cpp
+  src/core/nebula_ctx.cpp
+  src/core/task.cpp
+  src/core/tree_check.cpp
   src/nodes/checkpoint.cpp
+  src/nodes/compensable.cpp
   src/nodes/for_each.cpp
+  src/nodes/reactive_guard.cpp
   src/nodes/retry_with_delay.cpp
   src/nodes/switch_n.cpp
   src/nodes/while_loop.cpp)
@@ -115,4 +127,5 @@ write_basic_package_version_file(
 install(FILES
   "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfig.cmake"
   "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfigVersion.cmake"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nebulabt-embed.cmake"
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nebulabt)

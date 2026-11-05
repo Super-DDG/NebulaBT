@@ -13,6 +13,7 @@ void to_json(nlohmann::json& j, const FailureRecord& r) {
     {"message", r.message},
     {"attempt", r.attempt},
     {"timestamp", r.timestamp},
+    {"inputs", r.inputs.is_object() ? r.inputs : nlohmann::json::object()},
   };
 }
 
@@ -23,6 +24,9 @@ void from_json(const nlohmann::json& j, FailureRecord& r) {
   r.message = j.value("message", "");
   r.attempt = j.value("attempt", 1);
   r.timestamp = j.value("timestamp", "");
+  if (j.contains("inputs") && j["inputs"].is_object()) {
+    r.inputs = j["inputs"];
+  }
 }
 
 void FailureLog::add(FailureRecord record) {

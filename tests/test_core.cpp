@@ -2,6 +2,7 @@
 // 覆盖:同步/异步节点、ForEach、结构化失败、取消(halt 传播)、定时器
 
 #include <nebulabt/core/engine.hpp>
+#include <nebulabt/core/journal_file.hpp>
 #include <nebulabt/core/scheduler.hpp>
 #include <nebulabt/sdk/action.hpp>
 #include <nebulabt/testkit/mock.hpp>
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -928,6 +930,569 @@ static void test_checkpoint_in_loop() {
   CHECK(side->calls.load() == 2);  // 两次迭代都执行了,而非被误跳过只剩 1 次
 }
 
+// ---- M4.1:journal 文件掉电安全(帧格式 + CRC + 撕裂容错)----
+static void test_journal_file() {
+  const std::string path = "/tmp/nebulabt_test_journal.bin";
+  std::remove(path.c_str());
+
+  JournalEvent a;
+  a.task_id = "t1"; a.task_type = "demo";
+  a.event = "submitted"; a.data = nlohmann::json{{"k", 1}};
+  JournalEvent b;
+  b.task_id = "t1"; b.event = "checkpoint";
+  b.data = nlohmann::json{{"id", "cp1"}, {"blackboard", nlohmann::json::object()}};
+
+  {
+    JournalFileWriter w;
+    CHECK(w.open(path, false, JournalFsync::PerEvent));
+    CHECK(w.append(a));
+    CHECK(w.append(b));
+  }
+  nlohmann::json arr;
+  JournalFileReadStats st;
+  CHECK(readJournalFile(path, arr, &st));
+  CHECK(arr.size() == 2);
+  CHECK(!st.torn_tail);
+  CHECK(arr[0]["event"] == "submitted");
+  CHECK(arr[1]["data"]["id"] == "cp1");
+
+  // 掉电模拟 1:帧头被截断(半截帧)→ 完好前缀保留 + torn_tail 标记
+  {
+    std::ofstream f(path, std::ios::app | std::ios::binary);
+    const char torn[] = {0x40, 0x00, 0x00, 0x00, 0x11};
+    f.write(torn, sizeof(torn));
+  }
+  CHECK(readJournalFile(path, arr, &st));
+  CHECK(arr.size() == 2);
+  CHECK(st.torn_tail);
+
+  // 掉电模拟 2:帧头完整但 payload 写坏(CRC 不符)→ 同样容错
+  std::remove(path.c_str());
+  {
+    JournalFileWriter w;
+    CHECK(w.open(path, false));
+    CHECK(w.append(a));
+  }
+  {
+    std::ofstream f(path, std::ios::app | std::ios::binary);
+    const std::string payload = "{\"x\":1}";
+    std::vector<uint8_t> frame{0x07, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD};
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    f.write(reinterpret_cast<const char*>(frame.data()),
+            static_cast<std::streamsize>(frame.size()));
+  }
+  CHECK(readJournalFile(path, arr, &st));
+  CHECK(arr.size() == 1);
+  CHECK(st.torn_tail);
+
+  std::remove(path.c_str());
+}
+
+// ---- M4.2:资源上限 ----
+static void test_limits() {
+  // scheduler 队列上限:满则拒绝
+  {
+    Scheduler sched;
+    sched.start();
+    sched.setLimits(1, 0);
+    std::atomic<bool> release{false};
+    CHECK(sched.post([&release] {
+      while (!release.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // 占住调度线程
+    CHECK(sched.post([] {}));   // 1/1:入队
+    CHECK(!sched.post([] {}));  // 满了:拒绝
+    release.store(true);
+    sched.stop();
+  }
+
+  // 活动任务上限:超限提交返回空句柄,取消后名额释放
+  {
+    Engine engine;
+    engine.registerAction("Forever", std::make_shared<Forever>());
+    EngineLimits limits;
+    limits.max_active_tasks = 2;
+    engine.setLimits(limits);
+
+    const char* xml = R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)";
+    TaskSpec s1, s2, s3;
+    s1.task_id = "a"; s2.task_id = "b"; s3.task_id = "c";
+    auto t1 = engine.submitFromText(xml, s1);
+    auto t2 = engine.submitFromText(xml, s2);
+    CHECK(bool(t1) && bool(t2));
+    auto t3 = engine.submitFromText(xml, s3);
+    CHECK(!t3);  // 超限拒绝
+    CHECK(t1.cancel());
+    CHECK(t1.waitFor(std::chrono::milliseconds(500)) == TaskState::Canceled);
+    auto t4 = engine.submitFromText(xml, s3);
+    CHECK(bool(t4));  // 名额已释放
+    CHECK(t2.cancel());
+    CHECK(t4.cancel());
+  }
+}
+
+// ---- M6.1:虚拟时钟(重试/超时/watchdog 零真实等待)----
+static void test_virtual_clock() {
+  // 1) RetryWithDelay:延时随 advanceTime 推进,重试耗尽即失败
+  {
+    auto clock = std::make_shared<VirtualClock>();
+    Engine engine(clock);
+    auto failer = std::make_shared<Failer>();
+    engine.registerAction("Failer", failer);
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <RetryWithDelay attempts="3" delay_ms="1000" budget_ms="100000">
+          <Failer/>
+        </RetryWithDelay>
+      </BehaviorTree></root>)");
+    CHECK(task.waitFor(std::chrono::milliseconds(50)) == TaskState::Running);
+    engine.advanceTime(1000);   // 第 1 次重试延时到期
+    engine.advanceTime(1000);   // 第 2 次重试延时到期
+    CHECK(task.waitFor(std::chrono::milliseconds(100)) == TaskState::Failed);
+    CHECK(failer->calls.load() == 3);
+  }
+
+  // 2) 任务超时:到点即触发,零真实等待
+  {
+    auto clock = std::make_shared<VirtualClock>();
+    Engine engine(clock);
+    engine.registerAction("Forever", std::make_shared<Forever>());
+
+    TaskSpec spec;
+    spec.timeout_ms = 5000;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)",
+      spec);
+    CHECK(task.waitFor(std::chrono::milliseconds(50)) == TaskState::Running);
+    engine.advanceTime(4999);
+    CHECK(task.waitFor(std::chrono::milliseconds(50)) == TaskState::Running);
+    engine.advanceTime(1);
+    CHECK(task.waitFor(std::chrono::milliseconds(100)) == TaskState::Failed);
+    auto failures = task.failures();
+    CHECK(failures.size() == 1);
+    CHECK(failures[0].code == "TASK_TIMEOUT");
+  }
+
+  // 3) watchdog:静默随虚拟时间累积,触发一次
+  {
+    auto clock = std::make_shared<VirtualClock>();
+    Engine engine(clock);
+    auto forever = std::make_shared<Forever>();
+    engine.registerAction("Forever", forever);
+    std::atomic<int> fired{0};
+    engine.setWatchdog(std::chrono::milliseconds(100), true,
+                       [&fired](const std::string&, uint64_t quiet) {
+                         fired.fetch_add(1);
+                         CHECK(quiet >= 100);
+                       });
+    TaskSpec spec;
+    spec.watchdog_ms = 100;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)",
+      spec);
+    engine.advanceTime(99);
+    CHECK(task.waitFor(std::chrono::milliseconds(50)) == TaskState::Running);
+    engine.advanceTime(1);
+    CHECK(task.waitFor(std::chrono::milliseconds(100)) == TaskState::Failed);
+    CHECK(fired.load() == 1);
+    CHECK(forever->halted.load());
+  }
+
+  // 4) 真实时钟引擎上 advanceTime 无效(告警,不崩溃)
+  {
+    Engine engine;
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    engine.advanceTime(1000);  // 仅告警
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Ok/></BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Succeeded);
+  }
+}
+
+// ---- M7:Groot2 对接 / 运行中 explain / 失败富化 ----
+static void test_m7_observability() {
+  // 1) 失败自动富化:failure.inputs 携带激活时刻的输入端口快照
+  {
+    Engine engine;
+    class Boom : public NebulaAction {
+    public:
+      BT::PortsList providedPorts() const override {
+        return { BT::InputPort<std::string>("sku"),
+                 BT::InputPort<int>("qty") };
+      }
+      NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        ctx.fail("E_BOOM", "injected");
+        return NodeStatus::FAILURE;
+      }
+    };
+    engine.registerAction("Boom", std::make_shared<Boom>());
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Boom sku="{sku}" qty="{qty}"/>
+      </BehaviorTree></root>)",
+      [&] {
+        TaskSpec s;
+        s.slots["sku"] = "sku-9";
+        s.slots["qty"] = 3;
+        return s;
+      }());
+    CHECK(task.wait() == TaskState::Failed);
+    auto failures = task.failures();
+    CHECK(failures.size() == 1);
+    CHECK(failures[0].inputs["sku"] == "sku-9");
+    CHECK(failures[0].inputs["qty"] == 3);
+  }
+
+  // 2) 运行中 explain:任务 RUNNING 时安全获取树快照
+  {
+    Engine engine;
+    engine.registerAction("Forever", std::make_shared<Forever>());
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const nlohmann::json j = task.explain();  // RUNNING 中调用(M7 前不安全)
+    CHECK(j["state"] == "RUNNING");
+    CHECK(j.contains("tree"));
+    CHECK(j["tree"]["status"] == "RUNNING");
+    CHECK(task.cancel());
+  }
+
+  // 3) Groot2 publisher:创建、运行、析构全程无异常
+  {
+    Engine engine;
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    TaskSpec spec;
+    spec.groot2_port = 27183;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Ok/></BehaviorTree></root>)",
+      spec);
+    CHECK(task.wait() == TaskState::Succeeded);
+  }
+}
+
+// ---- M5.1:Compensable Saga 补偿 ----
+static void test_compensable() {
+  // 补偿动作:按执行顺序记录释放的 id
+  class Release : public NebulaAction {
+  public:
+    std::shared_ptr<std::vector<std::string>> log;
+    BT::PortsList providedPorts() const override {
+      return { BT::InputPort<std::string>("id") };
+    }
+    NodeStatus start(NebulaCtx& ctx, const Done&) override {
+      log->push_back(ctx.in<std::string>("id"));
+      return NodeStatus::SUCCESS;
+    }
+  };
+
+  const char* sagaXml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <Sequence>
+        <Compensable id="reserve">
+          <SideEffect/>
+          <Release id="release_reserve"/>
+        </Compensable>
+        <Compensable id="charge">
+          <SideEffect/>
+          <Release id="release_charge"/>
+        </Compensable>
+        <Trailing/>
+      </Sequence>
+    </BehaviorTree></root>)";
+
+  // 1) 尾随步骤失败 → 逆序自动补偿
+  {
+    Engine engine;
+    auto side = std::make_shared<SideEffect>();
+    auto released = std::make_shared<std::vector<std::string>>();
+    auto rel = std::make_shared<Release>();
+    rel->log = released;
+    engine.registerAction("SideEffect", side);
+    engine.registerAction("Release", rel);
+    engine.registerAction("Trailing", std::make_shared<Failer>());
+
+    auto task = engine.submitFromText(sagaXml);
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(side->calls.load() == 2);       // 两个主工作都执行过
+    CHECK(released->size() == 2);
+    CHECK((*released)[0] == "release_charge");  // 逆序:后完成的先补偿
+    CHECK((*released)[1] == "release_reserve");
+
+    bool armed = false, started = false, done = false;
+    for (const auto& e : task.journal()) {
+      if (e.event == "compensation_armed") armed = true;
+      if (e.event == "compensation_started") started = true;
+      if (e.event == "compensation_done") done = true;
+    }
+    CHECK(armed && started && done);
+  }
+
+  // 2) 全部成功 → 补偿永不执行
+  {
+    Engine engine;
+    auto released = std::make_shared<std::vector<std::string>>();
+    auto rel = std::make_shared<Release>();
+    rel->log = released;
+    engine.registerAction("SideEffect", std::make_shared<SideEffect>());
+    engine.registerAction("Release", rel);
+    engine.registerAction("Trailing", std::make_shared<Ok>());
+
+    auto task = engine.submitFromText(sagaXml);
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(released->empty());
+  }
+
+  // 3) 超时失败也触发补偿:主工作已完成,后续长步骤被超时打断
+  {
+    Engine engine;
+    auto side = std::make_shared<SideEffect>();
+    auto released = std::make_shared<std::vector<std::string>>();
+    auto rel = std::make_shared<Release>();
+    rel->log = released;
+    engine.registerAction("SideEffect", side);
+    engine.registerAction("Forever", std::make_shared<Forever>());
+    engine.registerAction("Release", rel);
+
+    TaskSpec spec;
+    spec.timeout_ms = 80;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <Compensable id="reserve">
+            <SideEffect/>
+            <Release id="release_reserve"/>
+          </Compensable>
+          <Forever/>
+        </Sequence>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(side->calls.load() == 1);
+    CHECK(released->size() == 1);   // 超时照样补偿已完成的副作用
+    CHECK((*released)[0] == "release_reserve");
+  }
+
+  // 4) 取消不触发补偿(取消语义由业务在 halt() 里决定)
+  {
+    Engine engine;
+    auto side = std::make_shared<SideEffect>();
+    auto released = std::make_shared<std::vector<std::string>>();
+    auto rel = std::make_shared<Release>();
+    rel->log = released;
+    engine.registerAction("SideEffect", side);
+    engine.registerAction("Forever", std::make_shared<Forever>());
+    engine.registerAction("Release", rel);
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <Compensable id="reserve">
+            <SideEffect/>
+            <Release id="release_reserve"/>
+          </Compensable>
+          <Forever/>
+        </Sequence>
+      </BehaviorTree></root>)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));  // 等主工作完成
+    CHECK(side->calls.load() == 1);
+    CHECK(task.cancel());
+    CHECK(task.waitFor(std::chrono::milliseconds(500)) == TaskState::Canceled);
+    CHECK(released->empty());
+  }
+}
+
+// ---- M5.2:ReactiveGuard 运行期守护 ----
+static void test_reactive_guard() {
+  // 1) 守护破坏 → halt 子树 + GUARD_VIOLATED + 父层恢复分支
+  {
+    // 启动子树后把守护键翻转为 false(经 Output 端口写黑板)
+    class FlipFalse : public NebulaAction {
+    public:
+      BT::PortsList providedPorts() const override {
+        return { BT::OutputPort<bool>("out") };
+      }
+      NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        ctx.out("out", false);
+        return NodeStatus::SUCCESS;
+      }
+    };
+    Engine engine;
+    auto forever = std::make_shared<Forever>();
+    engine.registerAction("Forever", forever);
+    engine.registerAction("FlipFalse", std::make_shared<FlipFalse>());
+    engine.registerAction("Ok", std::make_shared<Ok>());
+
+    TaskSpec spec;
+    spec.slots["safe"] = true;
+    // schema 声明 → safe 按真实 bool 注入(FlipFalse 之后写 bool 才不冲突)
+    spec.schema = nlohmann::json{
+        {"slots", {{"safe", {{"type", "bool"}, {"required", true}}}}}};
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Fallback>
+          <ReactiveGuard while_true="{safe}" period_ms="40">
+            <Sequence>
+              <FlipFalse out="{safe}"/>
+              <Forever/>
+            </Sequence>
+          </ReactiveGuard>
+          <Ok/>
+        </Fallback>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Succeeded);  // Fallback 走到恢复分支
+    CHECK(forever->halted.load());               // 在途工作被打断
+    bool violated = false;
+    for (const auto& f : task.failures()) {
+      if (f.code == "GUARD_VIOLATED") violated = true;
+    }
+    CHECK(violated);
+  }
+
+  // 2) 进入即违反(fail-closed:键缺失也算违反)→ 子树从未启动
+  {
+    Engine engine;
+    auto forever = std::make_shared<Forever>();
+    engine.registerAction("Forever", forever);
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <ReactiveGuard while_true="{safe}" period_ms="40">
+          <Forever/>
+        </ReactiveGuard>
+      </BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(!forever->halted.load());  // 子树从未 RUNNING,谈不上 halt
+    bool violated = false;
+    for (const auto& f : task.failures()) {
+      if (f.code == "GUARD_VIOLATED") violated = true;
+    }
+    CHECK(violated);
+  }
+
+  // 3) 条件持续成立 → 正常完成,巡检不误伤
+  {
+    Engine engine;
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    TaskSpec spec;
+    spec.slots["safe"] = true;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <ReactiveGuard while_true="{safe}" period_ms="40">
+          <Ok/>
+        </ReactiveGuard>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Succeeded);
+  }
+}
+
+// ---- M5.3:资源仲裁 ----
+static void test_resources() {
+  Engine engine;
+  engine.registerAction("Forever", std::make_shared<Forever>());
+  const char* xml = R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)";
+
+  TaskSpec a; a.task_id = "a"; a.resources = {"gripper"};
+  auto ta = engine.submitFromText(xml, a);
+  CHECK(bool(ta));
+
+  TaskSpec b; b.task_id = "b"; b.resources = {"gripper"};
+  auto tb = engine.submitFromText(xml, b);
+  CHECK(!tb);  // 冲突拒绝
+
+  TaskSpec c; c.task_id = "c"; c.resources = {"arm"};
+  auto tc = engine.submitFromText(xml, c);
+  CHECK(bool(tc));  // 无交集可并行
+
+  CHECK(ta.cancel());
+  CHECK(ta.waitFor(std::chrono::milliseconds(500)) == TaskState::Canceled);
+
+  TaskSpec d; d.task_id = "d"; d.resources = {"gripper"};
+  auto td = engine.submitFromText(xml, d);
+  CHECK(bool(td));  // 终态后资源释放
+
+  CHECK(tc.cancel());
+  CHECK(td.cancel());
+}
+
+// ---- M4.3:watchdog 卡死检测 ----
+static void test_watchdog() {
+  // 1) 卡死任务:触发回调一次 + halt + TASK_WATCHDOG
+  {
+    Engine engine;
+    auto forever = std::make_shared<Forever>();
+    engine.registerAction("Forever", forever);
+    std::atomic<int> fired{0};
+    engine.setWatchdog(std::chrono::milliseconds(80), true,
+                       [&fired](const std::string&, uint64_t quiet_ms) {
+                         fired.fetch_add(1);
+                         CHECK(quiet_ms >= 80);
+                       });
+    TaskSpec spec;
+    spec.watchdog_ms = 80;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)",
+      spec);
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(fired.load() == 1);
+    CHECK(forever->halted.load());
+    auto failures = task.failures();
+    CHECK(failures.size() == 1);
+    CHECK(failures[0].code == "TASK_WATCHDOG");
+  }
+
+  // 2) 只告警不 halt:静默期触发一次,任务由动作完成而成功
+  {
+    Engine engine;
+    class SlowOk : public NebulaAction {
+    public:
+      BT::PortsList providedPorts() const override { return {}; }
+      NodeStatus start(NebulaCtx&, const Done& done) override {
+        std::thread([done] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          done(NodeStatus::SUCCESS, {});
+        }).detach();
+        return NodeStatus::RUNNING;
+      }
+    };
+    engine.registerAction("SlowOk", std::make_shared<SlowOk>());
+    std::atomic<int> fired{0};
+    engine.setWatchdog(std::chrono::milliseconds(60), false,
+                       [&fired](const std::string&, uint64_t) {
+                         fired.fetch_add(1);
+                       });
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><SlowOk/></BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(fired.load() == 1);  // 同一静默期只触发一次,不刷屏
+  }
+
+  // 3) 持续迁移的任务(重试循环)不误报
+  {
+    Engine engine;
+    engine.registerAction("Failer", std::make_shared<Failer>());
+    std::atomic<int> fired{0};
+    engine.setWatchdog(std::chrono::milliseconds(150), false,
+                       [&fired](const std::string&, uint64_t) {
+                         fired.fetch_add(1);
+                       });
+    TaskSpec spec;
+    spec.watchdog_ms = 150;
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <RetryWithDelay attempts="2" delay_ms="10" budget_ms="2000">
+          <Failer/>
+        </RetryWithDelay>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Failed);  // 重试耗尽
+    CHECK(fired.load() == 0);                 // 期间节点持续迁移,无静默
+  }
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -973,6 +1538,22 @@ int main() {
   std::cout << "ok  template override + requires\n";
   test_checkpoint_in_loop();
   std::cout << "ok  checkpoint inside loop (no false skip)\n";
+  test_journal_file();
+  std::cout << "ok  journal file (CRC + torn tail tolerance)\n";
+  test_limits();
+  std::cout << "ok  resource limits (queue + active tasks)\n";
+  test_watchdog();
+  std::cout << "ok  watchdog (stuck task detection)\n";
+  test_compensable();
+  std::cout << "ok  compensable (saga compensation in reverse order)\n";
+  test_reactive_guard();
+  std::cout << "ok  reactive guard (violation halts subtree)\n";
+  test_resources();
+  std::cout << "ok  resource arbitration (conflict rejected)\n";
+  test_virtual_clock();
+  std::cout << "ok  virtual clock (retry/timeout/watchdog instant)\n";
+  test_m7_observability();
+  std::cout << "ok  m7 observability (failure inputs / runtime explain / groot2)\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

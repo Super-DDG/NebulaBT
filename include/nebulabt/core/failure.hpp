@@ -18,6 +18,9 @@ struct FailureRecord {
   std::string message;     // 人可读说明
   int attempt = 1;         // 第几次尝试(重试场景由策略层填充)
   std::string timestamp;   // "YYYY-MM-DD HH:MM:SS.mmm"
+  /// 失败时的输入端口快照(激活时刻,{key} 已解析为黑板值)——
+  /// 排障时不用猜"当时参数是什么"(M7 富化;桥自动填充)
+  nlohmann::json inputs = nlohmann::json::object();
 };
 
 void to_json(nlohmann::json& j, const FailureRecord& r);

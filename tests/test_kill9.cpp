@@ -8,6 +8,7 @@
 // ============================================================================
 
 #include <nebulabt/core/engine.hpp>
+#include <nebulabt/core/journal_file.hpp>
 #include <nebulabt/sdk/action.hpp>
 
 #include <atomic>
@@ -73,18 +74,21 @@ static const char* kXml = R"(
   </BehaviorTree>
 </root>)";
 
-// 子进程:跑任务直到被杀;journal 逐行写入 journalPath
+// 子进程:跑任务直到被杀;journal 以帧格式(长度前缀+CRC)写入 journalPath
 static int runChild(const std::string& journalPath) {
   Engine engine;
   engine.registerAction("SideEffect", std::make_shared<SideEffect>());
   engine.registerAction("LongAction", std::make_shared<LongAction>(30000));
 
-  std::ofstream journalFile(journalPath, std::ios::app);
-  if (!journalFile) {
+  JournalFileWriter journalFile;
+  std::string err;
+  if (!journalFile.open(journalPath, /*append=*/false, JournalFsync::PerEvent,
+                        &err)) {
+    std::cerr << err << "\n";
     return 43;
   }
-  engine.setJournalSink([&](const JournalEvent& e) {
-    journalFile << nlohmann::json(e).dump() << std::endl;
+  engine.setJournalSink([&journalFile](const JournalEvent& e) {
+    journalFile.append(e);
   });
 
   auto task = engine.submitFromText(kXml);
@@ -107,11 +111,12 @@ int main() {
   bool hasCheckpoint = false;
   for (int i = 0; i < 100 && !hasCheckpoint; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    std::ifstream f(journalPath);
-    std::string line;
-    while (std::getline(f, line)) {
-      if (line.find("\"checkpoint\"") != std::string::npos) {
-        hasCheckpoint = true;
+    nlohmann::json peek;
+    if (readJournalFile(journalPath, peek)) {
+      for (const auto& e : peek) {
+        if (e.value("event", "") == "checkpoint") {
+          hasCheckpoint = true;
+        }
       }
     }
   }
@@ -123,6 +128,13 @@ int main() {
   CHECK(waitpid(pid, &status, 0) == pid);
   CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
 
+  // 掉电窗口模拟:kill 后追加半截帧,恢复侧必须保留完好前缀
+  {
+    std::ofstream f(journalPath, std::ios::app | std::ios::binary);
+    const char torn[] = {0x40, 0x00, 0x00, 0x00, 0x11, 0x22};
+    f.write(torn, sizeof(torn));
+  }
+
   // 恢复:读回 journal,新 Engine 提交同一棵树
   Engine engine;
   auto side = std::make_shared<SideEffect>();
@@ -130,18 +142,11 @@ int main() {
   engine.registerAction("LongAction", std::make_shared<LongAction>(50));
 
   TaskSpec spec;
-  std::ifstream f(journalPath);
-  std::string line;
-  while (std::getline(f, line)) {
-    if (line.empty()) continue;
-    try {
-      spec.resume_journal.push_back(nlohmann::json::parse(line));
-    } catch (const std::exception& e) {
-      // 崩溃瞬间可能写出行尾不完整的行:容错跳过(见 DESIGN 已知限制)
-      std::cerr << "skip incomplete journal line: " << e.what() << "\n";
-    }
-  }
-  CHECK(spec.resume_journal.size() >= 3);  // submitted/started/checkpoint
+  JournalFileReadStats stats;
+  std::string err;
+  CHECK(readJournalFile(journalPath, spec.resume_journal, &stats, &err));
+  CHECK(stats.torn_tail);  // 半截帧被识别为撕裂尾,而非致命错误
+  CHECK(stats.good_records >= 3);  // submitted/started/checkpoint
 
   auto task = engine.submitFromText(kXml, spec);
   CHECK(task.wait() == TaskState::Succeeded);

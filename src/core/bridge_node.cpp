@@ -1,0 +1,187 @@
+#include "bridge_node.hpp"
+
+#include "engine_core.hpp"
+#include <behaviortree_cpp/blackboard.h>
+#include <behaviortree_cpp/basic_types.h>
+
+namespace nebulabt {
+namespace detail {
+
+namespace {
+
+// result(json)中的键按端口类型写回 Output 端口
+void writeResultToOutputs(BT::TreeNode& node, const BT::PortsList& ports,
+                          const nlohmann::json& result) {
+  for (const auto& kv : ports) {
+    const std::string& name = kv.first;
+    const BT::PortInfo& info = kv.second;
+    const auto dir = info.direction();
+    if (dir != BT::PortDirection::OUTPUT && dir != BT::PortDirection::INOUT) {
+      continue;
+    }
+    if (!result.contains(name)) {
+      continue;
+    }
+    const auto& v = result.at(name);
+    try {
+      const auto& t = info.type();
+      if (t == typeid(std::string)) {
+        node.setOutput(name, v.get<std::string>());
+      } else if (t == typeid(double)) {
+        node.setOutput(name, v.get<double>());
+      } else if (t == typeid(int)) {
+        node.setOutput(name, v.get<int>());
+      } else if (t == typeid(bool)) {
+        node.setOutput(name, v.get<bool>());
+      } else {
+        node.setOutput(name, v.dump());
+      }
+    } catch (const std::exception&) {
+      node.setOutput(name, v.dump());
+    }
+  }
+}
+
+} // namespace
+
+BridgeNode::BridgeNode(const std::string& name, const BT::NodeConfig& config,
+                       NebulaActionPtr action, Scheduler* scheduler,
+                       EngineCore* core)
+  : BT::StatefulActionNode(name, config), action_(std::move(action)),
+    scheduler_(scheduler), core_(core), slot_(std::make_shared<Slot>()) {}
+
+BT::PortsList BridgeNode::providedPorts() { return {}; }
+
+struct BridgeNode::PendingResult {
+  BT::NodeStatus status;
+  nlohmann::json result;
+};
+
+struct BridgeNode::Slot {
+  std::mutex mu;
+  bool ready = false;
+  std::unique_ptr<PendingResult> data;
+};
+
+BT::NodeStatus BridgeNode::onStart() {
+  initCtx();
+  failCountAtStart_ =
+      (ctx_ && ctx_->failures_) ? ctx_->failures_->size() : 0;
+  BT::NodeStatus status = BT::NodeStatus::FAILURE;
+  try {
+    status = action_->start(*ctx_, makeDone());
+  } catch (const std::exception& e) {
+    ctx_->fail("ACTION_EXCEPTION", e.what());
+    return BT::NodeStatus::FAILURE;
+  }
+  if (status != BT::NodeStatus::RUNNING) {
+    // 同步完成:以返回值为准,丢弃可能已写入的 pending
+    clearPending();
+    if (status == BT::NodeStatus::FAILURE) {
+      maybeAutoRecordFailure();
+    }
+  }
+  return status;
+}
+
+BT::NodeStatus BridgeNode::onRunning() {
+  // done 已回调:应用结果并返回终态
+  if (auto result = takePending()) {
+    writeResultToOutputs(*this, action_->providedPorts(), result->result);
+    if (result->status == BT::NodeStatus::FAILURE) {
+      maybeAutoRecordFailure();
+    }
+    return result->status;
+  }
+  // 等待 done 回调唤醒调度器
+  return BT::NodeStatus::RUNNING;
+}
+
+void BridgeNode::onHalted() {
+  if (ctx_) {
+    try {
+      action_->halt(*ctx_);
+    } catch (...) {
+    }
+  }
+  clearPending();
+}
+
+std::unique_ptr<BridgeNode::PendingResult> BridgeNode::takePending() {
+  std::lock_guard<std::mutex> lk(slot_->mu);
+  if (!slot_->ready) {
+    return nullptr;
+  }
+  slot_->ready = false;
+  return std::move(slot_->data);
+}
+
+void BridgeNode::clearPending() {
+  std::lock_guard<std::mutex> lk(slot_->mu);
+  slot_->ready = false;
+  slot_->data.reset();
+}
+
+/// 失败自动捕获:动作返回 FAILURE 却没有调用 ctx.fail() 时,
+/// 框架兜底记录一条 NODE_FAILURE(失败必须可解释,不依赖作者自觉)
+void BridgeNode::maybeAutoRecordFailure() {
+  if (!ctx_) {
+    return;
+  }
+  if (ctx_->failures_ && ctx_->failures_->size() != failCountAtStart_) {
+    return; // 作者已显式记录
+  }
+  ctx_->fail("NODE_FAILURE", "action returned FAILURE without ctx.fail()");
+}
+
+void BridgeNode::initCtx() {
+  std::string taskId = "unknown";
+  std::string taskType;
+  nlohmann::json inputs = nlohmann::json::object();
+  if (auto bb = config().blackboard) {
+    bb->get("task_id", taskId);      // bool 版 get,失败保持默认值
+    bb->get("task_type", taskType);
+  }
+  // 输入端口快照(激活时刻):{key} 引用解析黑板值,字面量保持 string
+  for (const auto& [port, remap] : config().input_ports) {
+    if (remap.size() >= 3 && remap.front() == '{' && remap.back() == '}') {
+      const std::string key = remap.substr(1, remap.size() - 2);
+      if (auto bb = config().blackboard) {
+        if (auto entry = bb->getAnyLocked(key)) {
+          inputs[port] = nebulabt::anyToJson(entry);
+          continue;
+        }
+      }
+      inputs[port] = nullptr;  // 引用的黑板键尚无值
+    } else {
+      inputs[port] = remap;    // 字面量
+    }
+  }
+  task_id_ = taskId;
+  // 直接 new(NebulaCtx 构造私有,friend 本类;make_unique 的实例化
+  // 上下文不继承 friend 权限,不能用于私有构造)
+  ctx_.reset(new NebulaCtx(*this, core_->findFailures(taskId),
+                           std::move(taskId), std::move(taskType)));
+  ctx_->inputs_ = std::move(inputs);
+}
+
+Done BridgeNode::makeDone() {
+  auto slot = slot_;
+  auto core = core_->shared_from_this();
+  auto taskId = task_id_;
+  return [slot, core, taskId](BT::NodeStatus status, nlohmann::json result) {
+    {
+      std::lock_guard<std::mutex> lk(slot->mu);
+      if (slot->ready) {
+        return; // 重复回调,只认第一次
+      }
+      slot->data = std::make_unique<PendingResult>(
+          PendingResult{status, std::move(result)});
+      slot->ready = true;
+    }
+    core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+  };
+}
+
+} // namespace detail
+} // namespace nebulabt

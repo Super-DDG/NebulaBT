@@ -2,16 +2,17 @@
 // order_fulfillment:后端订单履约示例
 //
 // 展示 NebulaBT 在后端服务的典型用法:
-//   - Fallback 双层兜底:主支付通道重试耗尽 → 备用通道 → 补偿(释放库存)
+//   - Compensable(Saga):扣库存声明补偿子树,发货失败时引擎自动逆序补偿
+//   - Fallback 通道级兜底:主支付通道重试耗尽 → 备用通道接管
 //   - RetryWithDelay 墙钟预算:支付重试不被无限拖死
 //   - Checkpoint:库存已扣减是业务安全点,失败恢复时不重复扣减
 //   - SwitchN:按订单档位(express/standard)分发发货通道
 //   - schema:订单参数加载期校验
 //
 // 三个场景(全部 mock,确定性断言):
-//   A. 正常履约:扣库存 → 主通道支付 → express 发货 → SUCCEEDED
+//   A. 正常履约:扣库存 → 主通道支付 → express 发货 → SUCCEEDED(无补偿)
 //   B. 主通道持续故障 → 重试耗尽 → 备用通道接管 → SUCCEEDED
-//   C. 发货失败 → 补偿路径释放库存(不重复扣减)→ FAILED
+//   C. 发货失败 → 引擎自动执行 Compensable 补偿,释放库存 → FAILED
 // ============================================================================
 
 #include <nebulabt/core/engine.hpp>
@@ -163,41 +164,36 @@ private:
 
 // ---------------------------------------------------------------------------
 // 履约树
-//   Fallback 双层结构:成功路径失败时进入补偿分支
+//   Compensable(Saga):扣库存声明补偿,发货失败时引擎自动逆序补偿——
+//     手写补偿分支从树里消失,"扣了库存忘了释放"在结构上不可能发生
 //   支付段:主通道带预算重试,耗尽落到备用通道(通道级降级)
 // ---------------------------------------------------------------------------
 static const char* kXml = R"(
 <root BTCPP_format="v4" main_tree_to_execute="fulfill_order">
   <BehaviorTree ID="fulfill_order">
-    <Fallback name="order_or_compensate">
-
-      <Sequence name="fulfill">
-        <ForEach array="{items}" element="{sku}">
-          <CheckItem sku="{sku}"/>
-        </ForEach>
+    <Sequence name="fulfill">
+      <ForEach array="{items}" element="{sku}">
+        <CheckItem sku="{sku}"/>
+      </ForEach>
+      <Compensable id="reserve_stock">
         <Checkpoint id="reserved">
           <ReserveStock/>
         </Checkpoint>
-        <Checkpoint id="paid">
-          <Fallback name="payment">
-            <RetryWithDelay attempts="3" delay_ms="30" budget_ms="2000">
-              <ChargePayment provider="primary"/>
-            </RetryWithDelay>
-            <ChargePayment provider="backup"/>
-          </Fallback>
-        </Checkpoint>
-        <SwitchN variable="{tier}" case_1="express">
-          <ShipOrder/>
-          <ShipOrder/>
-        </SwitchN>
-      </Sequence>
-
-      <Sequence name="compensate">
         <ReleaseStock/>
-        <AlwaysFailure/>
-      </Sequence>
-
-    </Fallback>
+      </Compensable>
+      <Checkpoint id="paid">
+        <Fallback name="payment">
+          <RetryWithDelay attempts="3" delay_ms="30" budget_ms="2000">
+            <ChargePayment provider="primary"/>
+          </RetryWithDelay>
+          <ChargePayment provider="backup"/>
+        </Fallback>
+      </Checkpoint>
+      <SwitchN variable="{tier}" case_1="express">
+        <ShipOrder/>
+        <ShipOrder/>
+      </SwitchN>
+    </Sequence>
   </BehaviorTree>
 </root>)";
 

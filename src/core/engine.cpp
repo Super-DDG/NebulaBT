@@ -1,698 +1,35 @@
 #include "nebulabt/core/engine.hpp"
 
-#include "nebulabt/core/scheduler.hpp"
+#include "bridge_node.hpp"
+#include "engine_core.hpp"
+#include "node_stats.hpp"
+#include "tree_check.hpp"
 #include "nebulabt/core/schema.hpp"
 #include "nebulabt/nodes/checkpoint.hpp"
+#include "nebulabt/nodes/compensable.hpp"
 #include "nebulabt/nodes/for_each.hpp"
+#include "nebulabt/nodes/reactive_guard.hpp"
 #include "nebulabt/nodes/retry_with_delay.hpp"
 #include "nebulabt/nodes/switch_n.hpp"
 #include "nebulabt/nodes/while_loop.hpp"
 
-#include <behaviortree_cpp/behavior_tree.h>
 #include <behaviortree_cpp/blackboard.h>
-#include <behaviortree_cpp/control_node.h>
-#include <behaviortree_cpp/decorator_node.h>
-#include <behaviortree_cpp/loggers/abstract_logger.h>
+#include <behaviortree_cpp/behavior_tree.h>
+#include <behaviortree_cpp/loggers/groot2_publisher.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstdio>
 #include <fstream>
-#include <map>
-#include <mutex>
-#include <set>
-#include <sstream>
+#include <memory>
 #include <stdexcept>
-#include <unordered_map>
+#include <vector>
 
 namespace nebulabt {
 
-// ============================================================================
-// TaskState / TaskHandle 前置实现
-// ============================================================================
-
-const char* toString(TaskState s) {
-  switch (s) {
-    case TaskState::Queued:    return "QUEUED";
-    case TaskState::Running:   return "RUNNING";
-    case TaskState::Succeeded: return "SUCCEEDED";
-    case TaskState::Failed:    return "FAILED";
-    case TaskState::Canceled:  return "CANCELED";
-  }
-  return "UNKNOWN";
-}
-
-// ============================================================================
-// detail:任务上下文与引擎核心
-// ============================================================================
-
 namespace detail {
 
-struct EngineCore;
-
-// ---- 节点计时(explain 完整版)----
-// 每次 IDLE->RUNNING 计一次 attempt;RUNNING->终态 累计运行时长。
-struct NodeStat {
-  int attempts = 0;
-  double running_ms = 0;   // 累计 RUNNING 时长(相对任务起点)
-  double first_ms = -1;    // 首次状态迁移
-  double last_ms = -1;     // 最近状态迁移
-  double run_start_ms = 0; // 本次 RUNNING 的起点
-  bool in_running = false;
-};
-
-struct NodeStatsMap {
-  std::mutex mu;
-  std::map<std::string, NodeStat> by_path;
-};
-
-// 订阅全树状态迁移(BT.CPP StatusChangeLogger),填充 NodeStatsMap。
-// 时间戳用相对模式(相对 logger 构造时刻 ≈ 任务提交时刻)。
-class TaskTraceLogger : public BT::StatusChangeLogger {
-public:
-  TaskTraceLogger(BT::TreeNode* root, std::shared_ptr<NodeStatsMap> stats)
-    : BT::StatusChangeLogger(root), stats_(std::move(stats)) {
-    setTimestampType(BT::TimestampType::relative);
-  }
-
-  void callback(BT::Duration timestamp, const BT::TreeNode& node,
-                BT::NodeStatus prev, BT::NodeStatus status) override {
-    const double ms =
-        std::chrono::duration<double, std::milli>(timestamp).count();
-    std::lock_guard<std::mutex> lk(stats_->mu);
-    auto& st = stats_->by_path[node.fullPath()];
-    if (st.first_ms < 0) st.first_ms = ms;
-    st.last_ms = ms;
-
-    if (status == BT::NodeStatus::RUNNING) {
-      if (prev == BT::NodeStatus::IDLE) {
-        st.attempts++;
-      }
-      st.run_start_ms = ms;
-      st.in_running = true;
-    } else if (status == BT::NodeStatus::SUCCESS ||
-               status == BT::NodeStatus::FAILURE ||
-               status == BT::NodeStatus::IDLE) {
-      if (prev == BT::NodeStatus::IDLE) {
-        // 同步节点:IDLE 直达终态,没有 RUNNING 迁移
-        st.attempts++;
-      }
-      if (st.in_running) {
-        st.running_ms += ms - st.run_start_ms;
-        st.in_running = false;
-      }
-    }
-  }
-
-  void flush() override {}
-
-private:
-  std::shared_ptr<NodeStatsMap> stats_;
-};
-
-struct TaskContext {
-  std::string task_id;
-  std::string task_type;
-  std::string pack_name;    // 来源树包(M3;直接提交 XML 时为空)
-  std::string pack_version;
-  std::shared_ptr<BT::Tree> tree;
-  std::shared_ptr<NodeStatsMap> node_stats = std::make_shared<NodeStatsMap>();
-  std::shared_ptr<BT::StatusChangeLogger> trace;  // 声明在 tree 之后:先于树析构
-  std::shared_ptr<FailureLog> failures = std::make_shared<FailureLog>();
-  std::atomic<TaskState> state{TaskState::Queued};
-  std::atomic<bool> finished{false};
-  std::mutex wait_mu;
-  std::condition_variable wait_cv;
-
-  // journal(M2):任务事件日志 + 已完成检查点的黑板快照
-  static constexpr size_t kJournalMax = 1000;
-  std::mutex journal_mu;
-  std::vector<JournalEvent> journal;
-  // 仅含从 resume_journal 种子的检查点(上一轮的完成历史)。
-  // 本 run 新完成的检查点只进 journal,不进此 map——否则循环体内
-  // 第二次迭代会被 tryResume 误判"已完成"而跳过工作。
-  std::map<std::string, nlohmann::json> resume_checkpoints;
-};
-
-struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
-  // ---- 树包注册表(M3)----
-  struct PackEntry {
-    PackManifest manifest;
-    std::string dir;  // manifest 所在目录
-  };
-  struct Canary {
-    std::string pack;
-    std::string version;
-    int percent = 0;
-  };
-
-  BT::BehaviorTreeFactory factory;
-  Scheduler scheduler;
-  std::mutex mu;
-  std::unordered_map<std::string, std::shared_ptr<TaskContext>> active;
-  std::vector<PackEntry> packs;  // mu_ 保护
-  Canary canary;                 // mu_ 保护
-  Engine::FinishedCallback on_finished;  // mu_ 保护
-  Engine::JournalSink journal_sink;      // mu_ 保护
-  Engine::LogCallback log = [](LogLevel, const std::string& msg) {
-    std::fprintf(stderr, "[nebulabt] %s\n", msg.c_str());
-  };
-
-  void logf(LogLevel lv, const std::string& msg) {
-    std::lock_guard<std::mutex> lk(mu);
-    if (log) log(lv, msg);
-  }
-
-  // ---- journal ----
-  void appendJournal(const std::shared_ptr<TaskContext>& ctx,
-                     const std::string& event, nlohmann::json data) {
-    JournalEvent e;
-    e.timestamp = nowTimestamp();
-    e.task_id = ctx->task_id;
-    e.task_type = ctx->task_type;
-    e.event = event;
-    e.data = std::move(data);
-    Engine::JournalSink sink;
-    {
-      std::lock_guard<std::mutex> lk(ctx->journal_mu);
-      if (ctx->journal.size() < TaskContext::kJournalMax) {
-        ctx->journal.push_back(e);
-      }
-      std::lock_guard<std::mutex> lk2(mu);
-      sink = journal_sink;
-    }
-    if (sink) {
-      sink(e);  // 锁外回调,避免死锁
-    }
-  }
-
-  // ---- ICheckpointHost ----
-  bool checkpointTryResume(const std::string& task_id,
-                           const std::string& cp_id,
-                           nlohmann::json* out_snapshot) override {
-    auto ctx = findTask(task_id);
-    if (!ctx) return false;
-    bool found = false;
-    nlohmann::json snap;
-    {
-      std::lock_guard<std::mutex> lk(ctx->journal_mu);
-      auto it = ctx->resume_checkpoints.find(cp_id);
-      if (it != ctx->resume_checkpoints.end()) {
-        snap = it->second;
-        found = true;
-      }
-    }
-    if (found) {
-      // 锁外记录(appendJournal 会再锁 journal_mu,不可重入)。
-      // 同时补一条 "checkpoint" 事件:多跳恢复(run3 从 run2 的 journal
-      // 恢复)时,完成历史得以延续,不会因只有 restored 事件而断链。
-      appendJournal(ctx, "checkpoint",
-                    nlohmann::json{{"id", cp_id}, {"blackboard", snap}});
-      appendJournal(ctx, "checkpoint_restored", nlohmann::json{{"id", cp_id}});
-    }
-    return found;
-  }
-
-  void checkpointRecord(const std::string& task_id, const std::string& cp_id,
-                        const nlohmann::json& snapshot) override {
-    auto ctx = findTask(task_id);
-    if (!ctx) return;
-    // 只进 journal:本 run 的完成历史;resume 历史只在提交时种子
-    appendJournal(ctx, "checkpoint",
-                  nlohmann::json{{"id", cp_id}, {"blackboard", snapshot}});
-  }
-
-  std::shared_ptr<TaskContext> findTask(const std::string& id) {
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = active.find(id);
-    return it != active.end() ? it->second : nullptr;
-  }
-
-  std::shared_ptr<FailureLog> findFailures(const std::string& taskId) {
-    auto ctx = findTask(taskId);
-    return ctx ? ctx->failures : nullptr;
-  }
-
-  void tickTask(const std::string& id) {
-    auto ctx = findTask(id);
-    if (!ctx) return;
-
-    TaskState expected = TaskState::Queued;
-    if (ctx->state.compare_exchange_strong(expected, TaskState::Running)) {
-      appendJournal(ctx, "started", nlohmann::json::object());
-    }
-    if (ctx->state.load() != TaskState::Running) {
-      return; // 已终态(如已取消)
-    }
-
-    BT::NodeStatus status;
-    try {
-      status = ctx->tree->tickOnce();
-    } catch (const std::exception& e) {
-      logf(LogLevel::Error, "task " + id + " tick exception: " + e.what());
-      finishTask(ctx, TaskState::Failed, e.what());
-      return;
-    }
-
-    if (status == BT::NodeStatus::RUNNING) return;
-    finishTask(ctx,
-               status == BT::NodeStatus::SUCCESS ? TaskState::Succeeded
-                                                 : TaskState::Failed,
-               std::string("tree returned ") + BT::toStr(status));
-  }
-
-  // ---- 树包路由(M3)----
-  static std::array<int, 3> parseVersion(const std::string& v) {
-    std::array<int, 3> out{0, 0, 0};
-    std::sscanf(v.c_str(), "%d.%d.%d", &out[0], &out[1], &out[2]);
-    return out;
-  }
-  static bool versionLess(const std::string& a, const std::string& b) {
-    return parseVersion(a) < parseVersion(b);
-  }
-  // FNV-1a:灰度确定性哈希
-  static uint64_t hashId(const std::string& s) {
-    uint64_t h = 1469598103934665603ull;
-    for (const char c : s) {
-      h ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
-      h *= 1099511628211ull;
-    }
-    return h;
-  }
-
-  // 按 task_type 选 pack 条目:显式版本 > 灰度 > 最高版本
-  const PackEntry* resolveTask(const std::string& taskType,
-                               const std::string& explicitVersion,
-                               const std::string& taskId) {
-    std::lock_guard<std::mutex> lk(mu);
-    const PackEntry* best = nullptr;
-    const PackEntry* canaryHit = nullptr;
-    const PackEntry* pinned = nullptr;
-    for (const auto& p : packs) {
-      if (!p.manifest.tasks.count(taskType)) continue;
-      if (!best || versionLess(best->manifest.version, p.manifest.version)) {
-        best = &p;
-      }
-      if (canary.percent > 0 && canary.pack == p.manifest.name &&
-          canary.version == p.manifest.version &&
-          (hashId(taskId) % 100) < static_cast<uint64_t>(canary.percent)) {
-        canaryHit = &p;
-      }
-      if (!explicitVersion.empty() && p.manifest.version == explicitVersion) {
-        pinned = &p;
-      }
-    }
-    if (pinned) return pinned;
-    if (canaryHit) return canaryHit;
-    return best;
-  }
-
-  void finishTask(std::shared_ptr<TaskContext> ctx, TaskState st,
-                  const std::string& reason) {
-    if (ctx->finished.exchange(true)) {
-      return; // 只允许一次终态迁移
-    }
-    ctx->state.store(st);
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      active.erase(ctx->task_id);
-    }
-    {
-      // 与 wait() 的谓词检查建立顺序,防止丢唤醒
-      std::lock_guard<std::mutex> lk(ctx->wait_mu);
-    }
-    ctx->wait_cv.notify_all();
-
-    appendJournal(ctx, "finished",
-                  nlohmann::json{{"state", toString(st)}, {"reason", reason}});
-
-    logf(LogLevel::Info, "task " + ctx->task_id + " " + toString(st) +
-                             (reason.empty() ? "" : " (" + reason + ")"));
-
-    Engine::FinishedCallback cb;
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      cb = on_finished;
-    }
-    if (cb) {
-      cb(TaskHandle(ctx, shared_from_this()));
-    }
-  }
-};
-
-// ============================================================================
-// detail:BridgeNode —— NebulaAction 与 BT.CPP 的桥
-//
-// 端口声明来自 action 实例(运行期),经
-//   factory.registerNodeType<BridgeNode>(id, ports, action, sched, core)
-// 注册(BT.CPP 4.x 支持显式传 PortsList)。
-//
-// 线程模型:onStart/onRunning 只在调度线程执行;done 可在任意线程调用,
-// 结果经 Slot(共享指针,生命周期独立于节点)暂存,再 post 唤醒调度器。
-// ============================================================================
-
-// result(json)中的键按端口类型写回 Output 端口
-static void writeResultToOutputs(BT::TreeNode& node, const BT::PortsList& ports,
-                                 const nlohmann::json& result) {
-  for (const auto& kv : ports) {
-    const std::string& name = kv.first;
-    const BT::PortInfo& info = kv.second;
-    const auto dir = info.direction();
-    if (dir != BT::PortDirection::OUTPUT && dir != BT::PortDirection::INOUT) {
-      continue;
-    }
-    if (!result.contains(name)) {
-      continue;
-    }
-    const auto& v = result.at(name);
-    try {
-      const auto& t = info.type();
-      if (t == typeid(std::string)) {
-        node.setOutput(name, v.get<std::string>());
-      } else if (t == typeid(double)) {
-        node.setOutput(name, v.get<double>());
-      } else if (t == typeid(int)) {
-        node.setOutput(name, v.get<int>());
-      } else if (t == typeid(bool)) {
-        node.setOutput(name, v.get<bool>());
-      } else {
-        node.setOutput(name, v.dump());
-      }
-    } catch (const std::exception&) {
-      node.setOutput(name, v.dump());
-    }
-  }
-}
-
-class BridgeNode : public BT::StatefulActionNode {
-public:
-  BridgeNode(const std::string& name, const BT::NodeConfig& config,
-             NebulaActionPtr action, Scheduler* scheduler, EngineCore* core)
-    : BT::StatefulActionNode(name, config), action_(std::move(action)),
-      scheduler_(scheduler), core_(core), slot_(std::make_shared<Slot>()) {}
-
-  static BT::PortsList providedPorts() { return {}; }
-
-  BT::NodeStatus onStart() override {
-    initCtx();
-    failCountAtStart_ =
-        (ctx_ && ctx_->failures_) ? ctx_->failures_->size() : 0;
-    BT::NodeStatus status = BT::NodeStatus::FAILURE;
-    try {
-      status = action_->start(*ctx_, makeDone());
-    } catch (const std::exception& e) {
-      ctx_->fail("ACTION_EXCEPTION", e.what());
-      return BT::NodeStatus::FAILURE;
-    }
-    if (status != BT::NodeStatus::RUNNING) {
-      // 同步完成:以返回值为准,丢弃可能已写入的 pending
-      clearPending();
-      if (status == BT::NodeStatus::FAILURE) {
-        maybeAutoRecordFailure();
-      }
-    }
-    return status;
-  }
-
-  BT::NodeStatus onRunning() override {
-    // done 已回调:应用结果并返回终态
-    if (auto result = takePending()) {
-      writeResultToOutputs(*this, action_->providedPorts(), result->result);
-      if (result->status == BT::NodeStatus::FAILURE) {
-        maybeAutoRecordFailure();
-      }
-      return result->status;
-    }
-    // 等待 done 回调唤醒调度器
-    return BT::NodeStatus::RUNNING;
-  }
-
-  void onHalted() override {
-    if (ctx_) {
-      try {
-        action_->halt(*ctx_);
-      } catch (...) {
-      }
-    }
-    clearPending();
-  }
-
-private:
-  struct PendingResult {
-    BT::NodeStatus status;
-    nlohmann::json result;
-  };
-  struct Slot {
-    std::mutex mu;
-    bool ready = false;
-    std::unique_ptr<PendingResult> data;
-  };
-
-  std::unique_ptr<PendingResult> takePending() {
-    std::lock_guard<std::mutex> lk(slot_->mu);
-    if (!slot_->ready) {
-      return nullptr;
-    }
-    slot_->ready = false;
-    return std::move(slot_->data);
-  }
-
-  void clearPending() {
-    std::lock_guard<std::mutex> lk(slot_->mu);
-    slot_->ready = false;
-    slot_->data.reset();
-  }
-
-  /// 失败自动捕获:动作返回 FAILURE 却没有调用 ctx.fail() 时,
-  /// 框架兜底记录一条 NODE_FAILURE(失败必须可解释,不依赖作者自觉)
-  void maybeAutoRecordFailure() {
-    if (!ctx_) {
-      return;
-    }
-    if (ctx_->failures_ && ctx_->failures_->size() != failCountAtStart_) {
-      return; // 作者已显式记录
-    }
-    ctx_->fail("NODE_FAILURE",
-               "action returned FAILURE without ctx.fail()");
-  }
-
-  void initCtx() {
-    std::string taskId = "unknown";
-    std::string taskType;
-    nlohmann::json inputs = nlohmann::json::object();
-    if (auto bb = config().blackboard) {
-      bb->get("task_id", taskId);      // bool 版 get,失败保持默认值
-      bb->get("task_type", taskType);
-    }
-    // 输入端口快照(激活时刻):{key} 引用解析黑板值,字面量保持 string
-    for (const auto& [port, remap] : config().input_ports) {
-      if (remap.size() >= 3 && remap.front() == '{' && remap.back() == '}') {
-        const std::string key = remap.substr(1, remap.size() - 2);
-        if (auto bb = config().blackboard) {
-          if (auto entry = bb->getAnyLocked(key)) {
-            inputs[port] = nebulabt::anyToJson(entry);
-            continue;
-          }
-        }
-        inputs[port] = nullptr;  // 引用的黑板键尚无值
-      } else {
-        inputs[port] = remap;    // 字面量
-      }
-    }
-    task_id_ = taskId;
-    // 直接 new(NebulaCtx 构造私有,friend 本类;make_unique 的实例化
-    // 上下文不继承 friend 权限,不能用于私有构造)
-    ctx_.reset(new NebulaCtx(*this, core_->findFailures(taskId),
-                             std::move(taskId), std::move(taskType)));
-    ctx_->inputs_ = std::move(inputs);
-  }
-
-  Done makeDone() {
-    auto slot = slot_;
-    auto core = core_->shared_from_this();
-    auto taskId = task_id_;
-    return [slot, core, taskId](BT::NodeStatus status, nlohmann::json result) {
-      {
-        std::lock_guard<std::mutex> lk(slot->mu);
-        if (slot->ready) {
-          return; // 重复回调,只认第一次
-        }
-        slot->data = std::make_unique<PendingResult>(
-            PendingResult{status, std::move(result)});
-        slot->ready = true;
-      }
-      core->scheduler.post([core, taskId] { core->tickTask(taskId); });
-    };
-  }
-
-  NebulaActionPtr action_;
-  Scheduler* scheduler_;
-  EngineCore* core_;
-  std::shared_ptr<Slot> slot_;
-  std::unique_ptr<NebulaCtx> ctx_;
-  std::string task_id_;
-  size_t failCountAtStart_ = 0;
-};
-
-// explain() 的树遍历:节点路径 + 当前状态 + 计时(attempts / running_ms)
-static nlohmann::json walkNode(const BT::TreeNode* node, const std::string& path,
-                               detail::NodeStatsMap* stats) {
-  nlohmann::json j;
-  j["name"] = node->name();
-  j["type"] = node->registrationName();
-  j["status"] = std::string(BT::toStr(node->status()));
-  const std::string here =
-      path.empty() ? node->name() : path + "/" + node->name();
-  j["path"] = here;
-
-  if (stats) {
-    std::lock_guard<std::mutex> lk(stats->mu);
-    auto it = stats->by_path.find(node->fullPath());
-    if (it != stats->by_path.end()) {
-      const auto& st = it->second;
-      j["attempts"] = st.attempts;
-      j["running_ms"] = std::round(st.running_ms * 10.0) / 10.0;
-      j["first_ms"] = std::round(st.first_ms * 10.0) / 10.0;
-      j["last_ms"] = std::round(st.last_ms * 10.0) / 10.0;
-    }
-  }
-
-  nlohmann::json children = nlohmann::json::array();
-  if (auto ctrl = dynamic_cast<const BT::ControlNode*>(node)) {
-    for (const BT::TreeNode* child : ctrl->children()) {
-      children.push_back(walkNode(child, here, stats));
-    }
-  } else if (auto dec = dynamic_cast<const BT::DecoratorNode*>(node)) {
-    if (dec->child()) {
-      children.push_back(walkNode(dec->child(), here, stats));
-    }
-  }
-  j["children"] = children;
-  return j;
-}
-
-// ============================================================================
-// L2 校验:树 ↔ schema 的端口级数据流检查
-//
-// 收集树中所有端口引用的黑板键({key} 形式),要求每个"被读"的键属于:
-//   schema 声明 / 框架注入(task_id, task_type)/ 树内某节点 Output 写出
-// 目标:键名拼写错误、忘记声明 slots 这类问题在加载期暴露,
-// 而不是运行时表现为"注入了但没人读"的空串。
-// ============================================================================
-
-struct KeyRef {
-  std::string key;
-  std::string node;
-  std::string port;
-  bool is_write;
-};
-
-static bool parseKeyRef(const std::string& remap, std::string* keyOut) {
-  if (remap.size() < 3 || remap.front() != '{' || remap.back() != '}') {
-    return false;
-  }
-  std::string key = remap.substr(1, remap.size() - 2);
-  // 去空白
-  const auto first = key.find_first_not_of(" \t");
-  const auto last = key.find_last_not_of(" \t");
-  if (first == std::string::npos) {
-    return false;
-  }
-  *keyOut = key.substr(first, last - first + 1);
-  return !keyOut->empty();
-}
-
-static void collectKeyRefs(const BT::TreeNode* node, std::vector<KeyRef>& refs) {
-  for (const auto& [port, remap] : node->config().input_ports) {
-    std::string key;
-    if (parseKeyRef(remap, &key)) {
-      refs.push_back(KeyRef{key, node->name(), port, false});
-    }
-  }
-  for (const auto& [port, remap] : node->config().output_ports) {
-    std::string key;
-    if (parseKeyRef(remap, &key)) {
-      refs.push_back(KeyRef{key, node->name(), port, true});
-    }
-  }
-  if (auto ctrl = dynamic_cast<const BT::ControlNode*>(node)) {
-    for (const BT::TreeNode* child : ctrl->children()) {
-      collectKeyRefs(child, refs);
-    }
-  } else if (auto dec = dynamic_cast<const BT::DecoratorNode*>(node)) {
-    if (dec->child()) {
-      collectKeyRefs(dec->child(), refs);
-    }
-  }
-}
-
-static void validateTreeKeys(const BT::Tree& tree,
-                             const std::map<std::string, SlotDef>& defs,
-                             std::vector<std::string>& errors) {
-  std::vector<KeyRef> refs;
-  collectKeyRefs(tree.rootNode(), refs);
-
-  std::set<std::string> produced{"task_id", "task_type"};  // 框架注入
-  for (const auto& [key, def] : defs) {
-    produced.insert(key);
-  }
-  for (const auto& ref : refs) {
-    if (ref.is_write) {
-      produced.insert(ref.key);
-    }
-  }
-  for (const auto& ref : refs) {
-    if (!ref.is_write && !produced.count(ref.key)) {
-      errors.push_back("node '" + ref.node + "' port '" + ref.port +
-                       "' reads undeclared blackboard key '" + ref.key +
-                       "' (not in schema and never written by the tree)");
-    }
-  }
-}
-
-static void injectSlots(BT::Tree& tree, const TaskSpec& spec,
-                        const std::map<std::string, SlotDef>& defs) {
-  auto bb = tree.rootBlackboard();
-  bb->set("task_id", spec.task_id);
-  bb->set("task_type", spec.task_type);
-  for (auto it = spec.slots.begin(); it != spec.slots.end(); ++it) {
-    const auto& v = it.value();
-    // schema 声明的标量类型按真实类型注入(类型已在 L1 校验通过)
-    auto defIt = defs.find(it.key());
-    if (defIt != defs.end()) {
-      const auto& type = defIt->second.type;
-      if (type == "int" && v.is_number_integer()) {
-        bb->set(it.key(), v.get<int>());
-        continue;
-      }
-      if (type == "double" && v.is_number()) {
-        bb->set(it.key(), v.get<double>());
-        continue;
-      }
-      if (type == "bool" && v.is_boolean()) {
-        bb->set(it.key(), v.get<bool>());
-        continue;
-      }
-    }
-    if (v.is_string()) {
-      bb->set(it.key(), v.get<std::string>());
-    } else if (v.is_array()) {
-      std::vector<std::string> vec;
-      vec.reserve(v.size());
-      for (const auto& e : v) {
-        vec.push_back(e.is_string() ? e.get<std::string>() : e.dump());
-      }
-      bb->set(it.key(), vec);
-    } else {
-      bb->set(it.key(), v.dump());
-    }
-  }
-}
-
-static std::string generateTaskId() {
+std::string generateTaskId() {
   static std::atomic<uint64_t> counter{0};
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch())
@@ -704,32 +41,19 @@ static std::string generateTaskId() {
 } // namespace detail
 
 // ============================================================================
-// NebulaCtx 实现
-// ============================================================================
-
-NebulaCtx::NebulaCtx(BT::TreeNode& node, std::shared_ptr<FailureLog> failures,
-                     std::string taskId, std::string taskType)
-  : node_(&node), failures_(std::move(failures)),
-    task_id_(std::move(taskId)), task_type_(std::move(taskType)) {}
-
-void NebulaCtx::fail(std::string code, std::string message) {
-  if (!failures_) {
-    return;
-  }
-  FailureRecord r;
-  r.code = std::move(code);
-  r.node = node_->name();
-  r.node_type = node_->registrationName();
-  r.message = std::move(message);
-  r.timestamp = nowTimestamp();
-  failures_->add(std::move(r));
-}
-
-// ============================================================================
 // Engine
 // ============================================================================
 
-Engine::Engine() : core_(std::make_shared<detail::EngineCore>()) {
+Engine::Engine(std::shared_ptr<VirtualClock> vclock)
+  : core_(std::make_shared<detail::EngineCore>()) {
+  // 时钟(M6):虚拟或真实;watchdog/活动戳与调度器定时器必须同源
+  if (vclock) {
+    core_->clock = vclock;
+    core_->scheduler.setVirtualClock(vclock);
+  } else {
+    core_->clock = std::make_shared<SteadyClock>();
+  }
+
   // 内置动态树原语与策略节点
   core_->factory.registerNodeType<ForEachNode>("ForEach");
   core_->factory.registerNodeType<WhileLoopNode>("WhileLoop");
@@ -746,6 +70,18 @@ Engine::Engine() : core_(std::make_shared<detail::EngineCore>()) {
   // Checkpoint 需要读写任务的检查点历史与 journal:注入宿主(EngineCore)
   core_->factory.registerNodeType<CheckpointNode>("Checkpoint",
                                                   core_.get());
+
+  // M5:Compensable 补偿原语(宿主管理任务的补偿栈)
+  core_->factory.registerNodeType<CompensableNode>("Compensable",
+                                                   core_.get());
+
+  // M5:ReactiveGuard 运行期守护(定时巡检经调度器,宿主记录违规)
+  core_->factory.registerNodeType<ReactiveGuardNode>(
+      "ReactiveGuard", &core_->scheduler,
+      [core](const std::string& taskId) {
+        core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+      },
+      core_.get());
 
   core_->scheduler.start();
 }
@@ -991,6 +327,30 @@ std::vector<std::string> Engine::validate(const std::string& xmlText,
   return errors;
 }
 
+void Engine::setLimits(const EngineLimits& limits) {
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    core_->limits = limits;
+  }
+  core_->scheduler.setLimits(limits.max_pending_jobs,
+                             limits.max_pending_timers);
+}
+
+void Engine::advanceTime(uint64_t ms) {
+  if (!core_->scheduler.advanceVirtualTime(ms)) {
+    core_->logf(LogLevel::Warn,
+                "advanceTime ignored: engine is not in virtual-clock mode");
+  }
+}
+
+void Engine::setWatchdog(std::chrono::milliseconds interval,
+                         bool halt_on_trigger, WatchdogCallback cb) {
+  std::lock_guard<std::mutex> lk(core_->mu);
+  core_->watchdog_ms = static_cast<uint64_t>(interval.count());
+  core_->watchdog_halt = halt_on_trigger;
+  core_->watchdog_cb = std::move(cb);
+}
+
 TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
                               const std::string& packName,
                               const std::string& packVersion) {
@@ -1003,9 +363,21 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
   ctx->pack_name = packName;
   ctx->pack_version = packVersion;
   ctx->tree = tree;
-  // 节点计时:订阅全树状态迁移(相对任务提交时刻)
-  ctx->trace = std::make_shared<detail::TaskTraceLogger>(tree->rootNode(),
-                                                         ctx->node_stats);
+  // 节点计时:订阅全树状态迁移(相对任务提交时刻);迁移同时刷新活动戳
+  ctx->activity->store(
+      static_cast<int64_t>(core_->clock->nowMs()));
+  ctx->trace = std::make_shared<detail::TaskTraceLogger>(
+      tree->rootNode(), ctx->node_stats, ctx->activity, core_->clock);
+  // Groot2 实时可视化(M7):端口被占用等异常只告警,不影响任务执行
+  if (spec.groot2_port != 0) {
+    try {
+      ctx->groot2 = std::make_shared<BT::Groot2Publisher>(*tree,
+                                                          spec.groot2_port);
+    } catch (const std::exception& e) {
+      core_->logf(LogLevel::Warn, "groot2 publisher on port " +
+                     std::to_string(spec.groot2_port) + " failed: " + e.what());
+    }
+  }
   {
     // 断点恢复(M2):从上一轮 journal 提取已完成的检查点快照
     std::lock_guard<std::mutex> lk(ctx->journal_mu);
@@ -1025,9 +397,39 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
       }
     }
   }
+  // 资源上限(M4)+ 资源仲裁(M5):超限/资源冲突 → 拒绝提交
+  std::string rejectReason;
   {
     std::lock_guard<std::mutex> lk(core_->mu);
-    core_->active[spec.task_id] = ctx;
+    if (core_->limits.max_active_tasks > 0 &&
+        core_->active.size() >= core_->limits.max_active_tasks) {
+      rejectReason = "max_active_tasks=" +
+                     std::to_string(core_->limits.max_active_tasks) +
+                     " reached";
+    } else if (!spec.resources.empty()) {
+      for (const auto& [tid, held] : core_->task_resources) {
+        for (const auto& r : spec.resources) {
+          if (std::find(held.begin(), held.end(), r) != held.end()) {
+            rejectReason =
+                "resource '" + r + "' held by task '" + tid + "'";
+            break;
+          }
+        }
+        if (!rejectReason.empty()) break;
+      }
+    }
+    if (rejectReason.empty()) {
+      core_->active[spec.task_id] = ctx;
+      if (!spec.resources.empty()) {
+        core_->task_resources[spec.task_id] = spec.resources;
+      }
+    }
+  }
+  if (!rejectReason.empty()) {
+    core_->logf(LogLevel::Error,
+                "submit rejected: " + rejectReason + " (task '" +
+                    spec.task_id + "')");
+    return TaskHandle();
   }
   TaskHandle handle(ctx, core_);
   core_->appendJournal(
@@ -1061,6 +463,19 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
       core->finishTask(ctx, TaskState::Failed, "task timeout");
     });
   }
+
+  // 策略:任务 watchdog(M4)。spec.watchdog_ms > 0 覆盖引擎默认
+  uint64_t watchdogMs = 0;
+  bool haltOnWatchdog = false;
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    watchdogMs = spec.watchdog_ms > 0 ? spec.watchdog_ms : core_->watchdog_ms;
+    haltOnWatchdog = core_->watchdog_halt;
+  }
+  if (watchdogMs > 0) {
+    core_->armWatchdog(ctx, watchdogMs);
+    (void)haltOnWatchdog;  // halt 行为在触发时读取 core_->watchdog_halt
+  }
   return handle;
 }
 
@@ -1077,92 +492,6 @@ void Engine::setJournalSink(JournalSink cb) {
 void Engine::setLogger(LogCallback cb) {
   std::lock_guard<std::mutex> lk(core_->mu);
   core_->log = std::move(cb);
-}
-
-// ============================================================================
-// TaskHandle
-// ============================================================================
-
-TaskHandle::TaskHandle(std::shared_ptr<detail::TaskContext> ctx,
-                       std::shared_ptr<detail::EngineCore> core)
-  : ctx_(std::move(ctx)), core_(std::move(core)) {}
-
-std::string TaskHandle::taskId() const {
-  return ctx_ ? ctx_->task_id : std::string();
-}
-
-TaskState TaskHandle::state() const {
-  return ctx_ ? ctx_->state.load() : TaskState::Failed;
-}
-
-TaskState TaskHandle::wait() {
-  if (!ctx_) {
-    return TaskState::Failed;
-  }
-  std::unique_lock<std::mutex> lk(ctx_->wait_mu);
-  ctx_->wait_cv.wait(lk, [this] { return isTerminal(ctx_->state.load()); });
-  return ctx_->state.load();
-}
-
-TaskState TaskHandle::waitFor(std::chrono::milliseconds timeout) const {
-  if (!ctx_) {
-    return TaskState::Failed;
-  }
-  std::unique_lock<std::mutex> lk(ctx_->wait_mu);
-  ctx_->wait_cv.wait_for(lk, timeout,
-                         [this] { return isTerminal(ctx_->state.load()); });
-  return ctx_->state.load();
-}
-
-bool TaskHandle::cancel() {
-  if (!ctx_ || isTerminal(ctx_->state.load())) {
-    return false;
-  }
-  auto core = core_;
-  auto ctx = ctx_;
-  core->scheduler.post([core, ctx] {
-    if (ctx->finished.load()) {
-      return;
-    }
-    ctx->tree->haltTree();
-    core->finishTask(ctx, TaskState::Canceled, "canceled by request");
-  });
-  return true;
-}
-
-std::vector<FailureRecord> TaskHandle::failures() const {
-  if (ctx_ && ctx_->failures) {
-    return ctx_->failures->snapshot();
-  }
-  return {};
-}
-
-std::vector<JournalEvent> TaskHandle::journal() const {
-  if (!ctx_) {
-    return {};
-  }
-  std::lock_guard<std::mutex> lk(ctx_->journal_mu);
-  return ctx_->journal;
-}
-
-nlohmann::json TaskHandle::explain() const {
-  if (!ctx_) {
-    return nlohmann::json();
-  }
-  nlohmann::json j;
-  j["task_id"] = ctx_->task_id;
-  j["task_type"] = ctx_->task_type;
-  if (!ctx_->pack_name.empty()) {
-    j["pack"] = ctx_->pack_name;
-    j["pack_version"] = ctx_->pack_version;
-  }
-  j["state"] = toString(ctx_->state.load());
-  if (ctx_->tree && ctx_->tree->rootNode()) {
-    j["tree"] = detail::walkNode(ctx_->tree->rootNode(), "",
-                                 ctx_->node_stats.get());
-  }
-  j["failures"] = failures();
-  return j;
 }
 
 } // namespace nebulabt

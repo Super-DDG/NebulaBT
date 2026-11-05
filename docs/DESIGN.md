@@ -158,20 +158,75 @@ resume 时的树版本一致性校验。
   显式钉住(恢复重跑必须钉住原版本)
 - 同名同版本重复加载抛异常;模板树+实例覆写与 `requires` 引用为后续演进
 
-### 4.10 测试替身(M3)
+### 4.9 确定性内核(M6,已实现)
+
+- **时钟注入**:`NebulaClock` 抽象 + `VirtualClock`(手动 advance)。超时 /
+  RetryWithDelay 延时 / watchdog / 活动戳统一走引擎时钟。`advanceTime(ms)`
+  两相推进:先在旧虚拟时刻排空已排队作业(submit 的首次 tick 不会被打上
+  未来时间戳),再把到期定时器按(到期时间,注册序)物化为调度作业并
+  等其级联执行完——advance 返回后引擎状态确定,测试零真实等待。
+  定时器仍由调度线程串行执行,单线程 tick 模型不变。
+- **故障注入**:`testkit::flaky(action, fail_first, code)` 注册层包装,
+  生产代码零改动;与虚拟时钟/Checkpoint 组合可复现任意恢复交错。
+- **恢复性质测试**:`test_property_recovery` —— 200 轮随机推进 × 随机
+  崩溃 × 恢复,断言"已记录检查点的副作用绝不再执行"(kill9 泛化)。
+- **`nebula replay`**:恢复态预演(跳过的检查点 / 恢复的黑板键 /
+  上次终态),纯 journal 分析不执行树;`--until N` 为时间旅行点。
+
+### 4.10 韧性原语(M5,已实现)
+
+业务反复手写的保护逻辑,做成引擎原语(保险由框架包裹,不靠作者自觉):
+
+- **Compensable(Saga 补偿)**:双子控制节点,child[0] 主工作、child[1]
+  补偿子树。主工作 SUCCESS 即武装(sagaPush + journal
+  compensation_armed);任务终态 FAILED 时引擎在唤醒 wait() **之前**
+  按武装逆序自动执行补偿(超时/看门狗路径同),补偿失败记
+  COMPENSATION_FAILED 并继续。SUCCEEDED/CANCELED 不触发补偿
+  (取消语义由业务在 halt() 里决定)。补偿同步执行(调度线程),
+  单条最多 tick 1000 次(防补偿内死循环)。
+- **ReactiveGuard(运行期守护)**:`while_true` 黑板 bool 键,进入前与
+  子树 RUNNING 期间每 period_ms 毫秒检查一次(调度器定时驱动 reactive
+  重 tick,RUNNING 中的动作返回缓存状态不会重跑)。违反 → halt 子树 +
+  GUARD_VIOLATED + 守护节点 FAILURE。键缺失/类型不符 fail-closed;
+  无 schema 提交时 bool slots 以字符串落黑板,兼容 "true"/"false" 形态。
+  while_true 必须声明为**无类型端口**:若声明为 InputPort<std::string>,
+  BT.CPP 会把绑定的黑板键钉成 string,与 bool 写入冲突。
+- **资源仲裁**:`TaskSpec.resources` 声明互斥资源;与活动任务声明集
+  有交集 → 提交拒绝,任务终态自动释放。单进程 map 实现,分布式留门。
+
+### 4.11 可观测与便携(M7,已实现)
+
+- **Groot2 实时可视化**:`TaskSpec.groot2_port` 经 BT.CPP 自带
+  Groot2Publisher 推送全树实时状态;publisher 生命周期与树一致,
+  构造失败(端口占用)只告警。每个运行中任务需独立端口。
+- **运行中 explain**:树遍历无锁,与 tick 并发读不安全——RUNNING 中
+  向调度线程投递快照 job(在 tick 线程内遍历),终态后直接遍历。
+  上限 2s:从调度线程自身调用会超时返回无树快照(文档明确)。
+- **树嵌入二进制**:`nebulabt_embed_trees(<target> NAME path...)`
+  配置期生成字符串常量头(`nebulabt_embed::NEBULA_TREE_<NAME>`),
+  无文件系统 MCU 可用、现场树文件不可被改坏;安装于
+  `lib/cmake/nebulabt/nebulabt-embed.cmake`。
+- **失败富化**:`FailureRecord.inputs` 由 `ctx.fail()` 自动填充
+  (激活时刻的输入端口快照)。
+- **尺寸基准**:nebulabt 自身 ~1.26 MB text(Release)。全量组件化
+  裁剪(#ifdef 拆 journal/checkpoint/pack)推迟:churn 大而当前无
+  MCU 硬目标;等真实目标出现按其预算裁剪。
+
+### 4.12 测试替身(M3)
 
 `testkit::ScriptedAction`:按脚本返回(`then / thenFail / always`),
 自动录制每次激活的输入端口快照(`calls()`,经 `NebulaCtx::inputsJson()`)。
 与 RetryWithDelay/Checkpoint 组合覆盖金路径、失败兜底、恢复重跑——全部 CI 内完成。
 
-### 4.9 `nebula` CLI(部分实现)
+### 4.12 `nebula` CLI(已实现)
 
 ```
 nebula validate <tree.xml> [schema.json]   # 加载期校验,CI 门禁(M1)
-nebula journal  <file.jsonl>               # 持久化 journal 排查(M2)
+nebula journal  <file>                     # journal 排查(帧格式/JSONL 自适应)
+nebula explain  <journal-file> [task_id]   # 执行轨迹还原(M2)
+nebula replay   <journal-file> [--until N] # 恢复态预演(M6)
 nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 ```
-规划:explain / replay。
 
 ## 5. 路线图 {#roadmap}
 
@@ -183,17 +238,25 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 | **M2 ✅** | explain 完整版(节点 attempts / running_ms)✅;**kill -9 实机恢复测试** ✅(fork 子进程真杀 + journal 落盘 + 新进程恢复);`nebula journal` CLI ✅ | tests/kill9:检查点先落盘 → SIGKILL → 新进程恢复,副作用零重复 |
 | **M3(核心已达成)** | 树包版本化(loadPack 加载即校验)✅;灰度路由 setCanary ✅;ScriptedAction 测试替身 ✅;`nebula doc` 自动流程图 ✅;robot_delivery 升级为 pack 工作流 ✅ | 20 组单测;pack 双版本灰度路由断言 |
 | M3 收尾 | 模板树+实例覆写;`requires` 引用;explain/replay CLI;1.0 发布(README 定稿/贡献指南) | 社区发布清单 |
+| **M4 ✅** | **稳定地基**:journal 帧格式落盘 + CRC + 撕裂容错 ✅;资源上限(活动任务/队列/定时器)✅;任务 watchdog 卡死检测 ✅;engine.cpp 拆分 ✅ | 掉电注入(半截帧/CRC 坏帧)恢复前缀完好;超限拒绝有测试;watchdog 触发/不误报有测试 |
+| **M5 ✅** | **韧性原语**:Compensable Saga 补偿 ✅;ReactiveGuard 运行期守护 ✅;资源仲裁 ✅;order_fulfillment 声明式补偿 ✅ | 补偿逆序/超时补偿/取消不补偿有测试;守护破坏 halt + fail-closed 有测试;资源冲突拒绝/终态释放有测试 |
+| **M6 ✅** | **确定性内核**:时钟注入(VirtualClock,advanceTime 两相推进)✅;故障注入 kit(testkit::flaky)✅;恢复性质测试 harness(200 轮随机交错)✅;`nebula replay` CLI ✅;journal/explain CLI 帧格式自适应 ✅ | 重试/超时/watchdog 虚拟时间零等待;性质测试断言已记录检查点副作用绝不再执行;replay 预演与引擎恢复语义一致 |
+| **M7 ✅** | **可观测与便携**:Groot2 实时可视化 ✅;运行中 explain(调度线程快照)✅;树嵌入二进制(nebulabt_embed_trees)✅;失败自动富化 ✅;尺寸基准 ~1.26 MB text | RUNNING 中 explain 有并发测试;嵌入树提交等同文件提交;groot2 端口占用不炸 |
 
 ## 6. 已知限制
 
 - explain 中节点状态为终态后会被 BT.CPP 重置为 IDLE,报告反映的是重置后状态(非运行中快照)
-- **explain() 应在任务终态后调用**:任务 RUNNING 期间调用会与调度线程并发读取
-  BT.CPP 内部状态(计时/失败/journal 数据本身有锁,树结构遍历没有)
+- explain(M7 后)在任务 RUNNING 时安全可用:树遍历经调度线程快照 job。
+  唯一限制:不要**从调度线程自身**(如 onFinished 之外的调度上下文)调用
+  ——会等到 2s 超时并返回无树快照;终态后调用走直接遍历,无此限制
 - 未提供 schema 时,slots 注入规则为 string / array→vector<string> / 其它 dump;
   提供后标量类型按真实类型注入
 - L2 数据流检查不覆盖 Script/ScriptCondition 代码串中引用的键
-- Checkpoint 快照支持 string/int/int64/double/bool/vector<string>,其它类型跳过;
-  不做原子落盘(进程崩溃瞬间正在写的 journal 行可能不完整,恢复侧应容错解析)
+- Checkpoint 快照支持 string/int/int64/double/bool/vector<string>,其它类型跳过
+- journal 落盘推荐走 `JournalFileWriter` 帧格式(长度前缀 + CRC32,
+  见 `core/journal_file.hpp`):崩溃瞬间最多损坏最后一帧,读取侧容错
+  截断到完好前缀并标记 `torn_tail`;裸 JSONL sink(逐行 `dump()`)仍可用,
+  但掉电窗口内的半行只能靠解析容错
 - FailureRecord.attempt 暂未由 RetryWithDelay 自动填充(记录粒度到节点级)
 - `ForEachNode` 仅支持 string 集合;结构化元素待后续类型系统
 
