@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(nebulabt VERSION 1.0.0 LANGUAGES CXX)
 
+# 提前开启:examples 子目录也注册 add_test(示例即测试)
+enable_testing()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -68,10 +71,11 @@ target_link_libraries(nebulabt PUBLIC ${NEBULABT_BT_CPP_TARGET})
 if(NEBULABT_BUILD_EXAMPLES)
   add_subdirectory(examples/hello_tree)
   add_subdirectory(examples/robot_delivery)
+  add_subdirectory(examples/game_npc)
+  add_subdirectory(examples/order_fulfillment)
 endif()
 
 if(NEBULABT_BUILD_TESTS)
-  enable_testing()
   add_subdirectory(tests)
 endif()
 

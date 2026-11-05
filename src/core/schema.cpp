@@ -7,6 +7,13 @@ bool jsonMatchesType(const nlohmann::json& v, const std::string& type) {
   if (type == "int") return v.is_number_integer();
   if (type == "double") return v.is_number();
   if (type == "bool") return v.is_boolean();
+  if (type == "string_array") {
+    if (!v.is_array()) return false;
+    for (const auto& e : v) {
+      if (!e.is_string()) return false;
+    }
+    return true;
+  }
   return false;
 }
 
@@ -31,9 +38,9 @@ std::map<std::string, SlotDef> parseSlotSchema(const nlohmann::json& schema,
     sd.type = def["type"].get<std::string>();
     sd.required = def.value("required", false);
     if (sd.type != "string" && sd.type != "int" && sd.type != "double" &&
-        sd.type != "bool") {
+        sd.type != "bool" && sd.type != "string_array") {
       errors.push_back("schema slot '" + key + "': unknown type '" + sd.type +
-                       "' (string|int|double|bool)");
+                       "' (string|int|double|bool|string_array)");
       continue;
     }
     defs[key] = sd;

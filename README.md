@@ -159,6 +159,18 @@ nebula explain  <journal.jsonl> [task_id]  # post-mortem: timeline, checkpoints,
 nebula doc      <tree.xml>                 # tree -> mermaid flowchart
 ```
 
+## Examples — one per industry, all CI-tested
+
+| Example | Industry | Showcases |
+|---|---|---|
+| [hello_tree](examples/hello_tree) | any | 5-minute quick start: sync + async nodes, ForEach, explain |
+| [robot_delivery](examples/robot_delivery) | robotics | data-driven search (N copies → 1), checkpoints, kill-resume, tree pack + schema |
+| [game_npc](examples/game_npc) | games | ReactiveFallback priority brain, WhileLoop patrol, SwitchN by personality, async animation |
+| [order_fulfillment](examples/order_fulfillment) | backend | payment fallback chains, retry wall-clock budget, compensation on failure, schema-validated orders |
+
+Every example asserts its outcomes and runs as a CTest case — they are living
+documentation, not screenshots.
+
 ## Status
 
 **1.0.0** — the core feature set is complete and regression-tested
