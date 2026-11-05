@@ -172,6 +172,7 @@ single-process only (journal design leaves the door open).
 
 - [English](README.md)
 - [简体中文](README.zh-CN.md)
+- **Usage guide / 使用文档:[docs/USAGE.md](docs/USAGE.md)** — from install to production: nodes, trees, schema, recovery, packs, testing, thread model
 
 ## Credits
 
