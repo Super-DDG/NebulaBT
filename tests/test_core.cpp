@@ -891,6 +891,43 @@ static void test_template_and_requires() {
   fresh.loadPack(dir2);  // 再加载依赖方:通过
 }
 
+// 回归:循环体内的 Checkpoint 不能被本 run 刚记录的检查点误跳过
+// (曾有 bug:record 与 resume 历史共用一个 map,第二次迭代被静默跳过)
+static void test_checkpoint_in_loop() {
+  Engine engine;
+  auto side = std::make_shared<SideEffect>();
+  engine.registerAction("SideEffect", side);
+  engine.registerAction("Ok", std::make_shared<Ok>());
+
+  auto condCount = std::make_shared<std::atomic<int>>(0);
+  class Cond : public NebulaAction {
+  public:
+    std::shared_ptr<std::atomic<int>> n;
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx&, const Done&) override {
+      return n->fetch_add(1) < 2 ? NodeStatus::SUCCESS : NodeStatus::FAILURE;
+    }
+  };
+  auto cond = std::make_shared<Cond>();
+  cond->n = condCount;
+  engine.registerAction("Cond", cond);
+
+  auto task = engine.submitFromText(R"(
+    <root BTCPP_format="v4"><BehaviorTree ID="t">
+      <WhileLoop>
+        <Cond/>
+        <Sequence>
+          <Checkpoint id="loop_cp">
+            <SideEffect/>
+          </Checkpoint>
+          <Ok/>
+        </Sequence>
+      </WhileLoop>
+    </BehaviorTree></root>)");
+  CHECK(task.wait() == TaskState::Succeeded);
+  CHECK(side->calls.load() == 2);  // 两次迭代都执行了,而非被误跳过只剩 1 次
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -934,6 +971,8 @@ int main() {
   std::cout << "ok  scripted mock\n";
   test_template_and_requires();
   std::cout << "ok  template override + requires\n";
+  test_checkpoint_in_loop();
+  std::cout << "ok  checkpoint inside loop (no false skip)\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

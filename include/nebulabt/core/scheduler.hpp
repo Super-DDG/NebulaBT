@@ -34,6 +34,11 @@ public:
   /// 线程安全;delay 毫秒后在调度线程执行 job
   void callLater(std::chrono::milliseconds delay, Job job);
 
+  /// 排空后停止:不再接受新任务,等队列清空且在飞 job 完成后 join。
+  /// 未触发的定时器被丢弃(销毁路径上的策略定时器已无意义)。
+  /// 用于 Engine 析构:保证已投递的收尾作业(如取消任务)真正执行。
+  void drainAndStop();
+
 private:
   struct Timer {
     Clock::time_point when;
@@ -54,6 +59,8 @@ private:
   std::priority_queue<Timer, std::vector<Timer>, TimerCmp> timers_;
   uint64_t timer_seq_ = 0;
   bool stopped_ = true;              // mu_ 保护
+  bool draining_ = false;            // mu_ 保护:拒绝新投递,等队列排空
+  std::atomic<int> in_flight_{0};    // 正在执行的 job 数
   std::atomic<bool> running_{false};
 };
 

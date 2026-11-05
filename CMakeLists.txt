@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nebulabt VERSION 0.1.0 LANGUAGES CXX)
+project(nebulabt VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,3 +78,37 @@ endif()
 if(NEBULABT_BUILD_TOOLS)
   add_subdirectory(tools)
 endif()
+
+# ---------------------------------------------------------------------------
+# 安装与 CMake 导出:下游可 find_package(nebulabt) 消费
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS nebulabt
+        EXPORT nebulabtTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/nebulabt DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT nebulabtTargets
+        FILE nebulabtTargets.cmake
+        NAMESPACE nebulabt::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nebulabt)
+
+# 最小 Config:让 find_package(nebulabt) 找到已导出的 target
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfig.cmake.in"
+"@PACKAGE_INIT@
+include(\"\${CMAKE_CURRENT_LIST_DIR}/nebulabtTargets.cmake\")
+check_required_components(nebulabt)
+")
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfig.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfig.cmake"
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nebulabt)
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfigVersion.cmake"
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/nebulabtConfigVersion.cmake"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nebulabt)

@@ -187,12 +187,14 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 ## 6. 已知限制
 
 - explain 中节点状态为终态后会被 BT.CPP 重置为 IDLE,报告反映的是重置后状态(非运行中快照)
+- **explain() 应在任务终态后调用**:任务 RUNNING 期间调用会与调度线程并发读取
+  BT.CPP 内部状态(计时/失败/journal 数据本身有锁,树结构遍历没有)
 - 未提供 schema 时,slots 注入规则为 string / array→vector<string> / 其它 dump;
   提供后标量类型按真实类型注入
 - L2 数据流检查不覆盖 Script/ScriptCondition 代码串中引用的键
 - Checkpoint 快照支持 string/int/int64/double/bool/vector<string>,其它类型跳过;
   不做原子落盘(进程崩溃瞬间正在写的 journal 行可能不完整,恢复侧应容错解析)
-- Engine 析构时未完成任务直接终止(halt 不会被调用),析构前应确保任务完成或取消
+- FailureRecord.attempt 暂未由 RetryWithDelay 自动填充(记录粒度到节点级)
 - `ForEachNode` 仅支持 string 集合;结构化元素待后续类型系统
 
 ## 7. 决策记录

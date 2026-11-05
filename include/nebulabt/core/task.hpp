@@ -4,6 +4,7 @@
 #include "nebulabt/core/failure.hpp"
 #include "nebulabt/core/journal.hpp"
 #include <behaviortree_cpp/contrib/json.hpp>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -60,6 +61,9 @@ public:
 
   /// 阻塞等待终态并返回(测试/示例用;服务侧请用 Engine::onFinished 回调)
   TaskState wait();
+
+  /// 带超时等待;超时返回当前状态(通常仍为 RUNNING)
+  TaskState waitFor(std::chrono::milliseconds timeout) const;
 
   /// 请求取消:halt 整棵树(回调各动作 halt())后进入 Canceled
   bool cancel();

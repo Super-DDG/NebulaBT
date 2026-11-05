@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev libtinyxml2-dev cmake
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest --output-on-failure
+
+      # 门禁:示例树必须通过加载期校验(pack 级全量校验由 loadPack 测试覆盖)
+      - name: Validate trees (CI gate)
+        run: ./build/tools/nebula validate examples/robot_delivery/pack/trees/pick_and_deliver.xml

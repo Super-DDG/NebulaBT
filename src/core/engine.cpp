@@ -131,7 +131,10 @@ struct TaskContext {
   static constexpr size_t kJournalMax = 1000;
   std::mutex journal_mu;
   std::vector<JournalEvent> journal;
-  std::map<std::string, nlohmann::json> checkpoints;
+  // 仅含从 resume_journal 种子的检查点(上一轮的完成历史)。
+  // 本 run 新完成的检查点只进 journal,不进此 map——否则循环体内
+  // 第二次迭代会被 tryResume 误判"已完成"而跳过工作。
+  std::map<std::string, nlohmann::json> resume_checkpoints;
 };
 
 struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
@@ -193,16 +196,21 @@ struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
     auto ctx = findTask(task_id);
     if (!ctx) return false;
     bool found = false;
+    nlohmann::json snap;
     {
       std::lock_guard<std::mutex> lk(ctx->journal_mu);
-      auto it = ctx->checkpoints.find(cp_id);
-      if (it != ctx->checkpoints.end()) {
-        *out_snapshot = it->second;
+      auto it = ctx->resume_checkpoints.find(cp_id);
+      if (it != ctx->resume_checkpoints.end()) {
+        snap = it->second;
         found = true;
       }
     }
     if (found) {
-      // 锁外记录事件(appendJournal 会再锁 journal_mu,不可重入)
+      // 锁外记录(appendJournal 会再锁 journal_mu,不可重入)。
+      // 同时补一条 "checkpoint" 事件:多跳恢复(run3 从 run2 的 journal
+      // 恢复)时,完成历史得以延续,不会因只有 restored 事件而断链。
+      appendJournal(ctx, "checkpoint",
+                    nlohmann::json{{"id", cp_id}, {"blackboard", snap}});
       appendJournal(ctx, "checkpoint_restored", nlohmann::json{{"id", cp_id}});
     }
     return found;
@@ -212,10 +220,7 @@ struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost {
                         const nlohmann::json& snapshot) override {
     auto ctx = findTask(task_id);
     if (!ctx) return;
-    {
-      std::lock_guard<std::mutex> lk(ctx->journal_mu);
-      ctx->checkpoints[cp_id] = snapshot;
-    }
+    // 只进 journal:本 run 的完成历史;resume 历史只在提交时种子
     appendJournal(ctx, "checkpoint",
                   nlohmann::json{{"id", cp_id}, {"blackboard", snapshot}});
   }
@@ -746,7 +751,25 @@ Engine::Engine() : core_(std::make_shared<detail::EngineCore>()) {
 }
 
 Engine::~Engine() {
-  core_->scheduler.stop();
+  // 取消全部活动任务(halt + CANCELED),再等调度器把取消作业执行完——
+  // 持有句柄的 wait() 会正常返回,不再永久挂起
+  std::vector<std::shared_ptr<detail::TaskContext>> toCancel;
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    for (auto& [id, ctx] : core_->active) {
+      toCancel.push_back(ctx);
+    }
+  }
+  for (auto& ctx : toCancel) {
+    core_->scheduler.post([core = core_, ctx] {
+      if (ctx->finished.load()) {
+        return;
+      }
+      ctx->tree->haltTree();
+      core->finishTask(ctx, TaskState::Canceled, "engine destroyed");
+    });
+  }
+  core_->scheduler.drainAndStop();
 }
 
 void Engine::registerAction(const std::string& registrationId,
@@ -887,6 +910,19 @@ TaskHandle Engine::submitTask(TaskSpec spec) {
   if (spec.task_id.empty()) {
     spec.task_id = detail::generateTaskId();
   }
+  // 恢复重跑自动钉住原 pack 版本:灰度翻转时,恢复必须与原执行版本一致,
+  // 否则检查点 id 对不上会导致已完成段被静默重执行
+  if (!spec.resume_journal.is_array() || spec.resume_journal.empty()) {
+    // 非恢复提交:不处理
+  } else if (spec.pack_version.empty()) {
+    for (const auto& e : spec.resume_journal) {
+      if (e.is_object() && e.value("event", "") == "submitted" &&
+          e.contains("data") && e["data"].value("pack_version", "").size() > 0) {
+        spec.pack_version = e["data"]["pack_version"].get<std::string>();
+        break;
+      }
+    }
+  }
   const detail::EngineCore::PackEntry* entry =
       core_->resolveTask(spec.task_type, spec.pack_version, spec.task_id);
   if (!entry) {
@@ -983,7 +1019,7 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
         }
         if (ev.event == "checkpoint" && ev.data.contains("id") &&
             ev.data.contains("blackboard")) {
-          ctx->checkpoints[ev.data["id"].get<std::string>()] =
+          ctx->resume_checkpoints[ev.data["id"].get<std::string>()] =
               ev.data["blackboard"];
         }
       }
@@ -1065,6 +1101,16 @@ TaskState TaskHandle::wait() {
   }
   std::unique_lock<std::mutex> lk(ctx_->wait_mu);
   ctx_->wait_cv.wait(lk, [this] { return isTerminal(ctx_->state.load()); });
+  return ctx_->state.load();
+}
+
+TaskState TaskHandle::waitFor(std::chrono::milliseconds timeout) const {
+  if (!ctx_) {
+    return TaskState::Failed;
+  }
+  std::unique_lock<std::mutex> lk(ctx_->wait_mu);
+  ctx_->wait_cv.wait_for(lk, timeout,
+                         [this] { return isTerminal(ctx_->state.load()); });
   return ctx_->state.load();
 }
 
