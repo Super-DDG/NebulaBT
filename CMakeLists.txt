@@ -12,6 +12,14 @@ option(NEBULABT_BUILD_EXAMPLES "Build NebulaBT examples" ON)
 option(NEBULABT_BUILD_TESTS "Build NebulaBT tests" ON)
 option(NEBULABT_BUILD_TOOLS "Build the nebula CLI" ON)
 
+# 消毒器(测试加固):address | undefined | thread | 组合(逗号分隔)
+#   cmake -S . -B build-asan -DNEBULABT_SANITIZE=address
+set(NEBULABT_SANITIZE "" CACHE STRING "Sanitizer: address|undefined|thread")
+if(NEBULABT_SANITIZE)
+  add_compile_options(-fsanitize=${NEBULABT_SANITIZE} -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=${NEBULABT_SANITIZE})
+endif()
+
 # 树嵌入(M7):nebulabt_embed_trees() 随安装包分发,下游可 include
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 

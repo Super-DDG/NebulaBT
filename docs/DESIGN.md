@@ -267,6 +267,16 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 
 ## 6. 已知限制
 
+- **BT.CPP 树创建非并发安全**:factory 内部持有共享 XMLParser,
+  同一 Engine 的并发 submit/validate 由 `create_mu` 串行化(压测实证;
+  sanitizer 因库未插桩而不可见)。不同 Engine 实例之间无共享,天然并行。
+- **TSan(GCC 11 libtsan)在本工具链不可用作门禁**:对
+  `condition_variable::wait_for`(timed)建模不全,mutex + timed cv 的
+  标准库最小复现即产生 double-lock/race 级联误报;框架代码的 TSan
+  报告已逐一溯源为该误报的下游。升级 GCC 12+/clang 后应复测。
+- ASan 泄漏检测中,BT.CPP/tinyxml2 未插桩库内部分配可能以 indirect
+  leak 形态出现;以"直接泄漏是否指向本仓库代码"为准。
+
 - explain 中节点状态为终态后会被 BT.CPP 重置为 IDLE,报告反映的是重置后状态(非运行中快照)
 - explain(M7 后)在任务 RUNNING 时安全可用:树遍历经调度线程快照 job。
   唯一限制:不要**从调度线程自身**(如 onFinished 之外的调度上下文)调用

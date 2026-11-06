@@ -20,6 +20,9 @@ namespace detail {
 
 struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost,
                     ISagaHost, IGuardHost {
+  // 外联析构(诊断见 engine_core.cpp):隐式内联析构 + 本类成员布局
+  // 下,销毁路径曾被编译器折叠,部分注册表存储未被释放(ASan 实证)
+  ~EngineCore();
   // ---- 树包注册表(M3)----
   struct PackEntry {
     PackManifest manifest;
@@ -35,6 +38,10 @@ struct EngineCore : std::enable_shared_from_this<EngineCore>, ICheckpointHost,
   Scheduler scheduler;
   std::shared_ptr<NebulaClock> clock;  // 真实/虚拟时钟(M6);watchdog/活动戳用
   std::mutex mu;
+  // 树创建串行化:BT.CPP factory 内部持有共享 XMLParser(bt_factory.cpp
+  // 的 _p->parser),并发 createTreeFromText/FromFile 会竞争它——库未
+  // 插桩,TSan/ASan 不可见;并发压测实证(Ok 任务偶发 FAILED)
+  std::mutex create_mu;
   std::unordered_map<std::string, std::shared_ptr<TaskContext>> active;
   std::vector<PackEntry> packs;  // mu 保护
   Canary canary;                 // mu 保护

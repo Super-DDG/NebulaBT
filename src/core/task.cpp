@@ -5,6 +5,7 @@
 #include <behaviortree_cpp/basic_types.h>
 #include <condition_variable>
 #include <mutex>
+#include <thread>
 
 namespace nebulabt {
 
@@ -48,10 +49,17 @@ TaskState TaskHandle::waitFor(std::chrono::milliseconds timeout) const {
   if (!ctx_) {
     return TaskState::Failed;
   }
-  std::unique_lock<std::mutex> lk(ctx_->wait_mu);
-  ctx_->wait_cv.wait_for(lk, timeout,
-                         [this] { return isTerminal(ctx_->state.load()); });
-  return ctx_->state.load();
+  // 原子轮询而非 cv.wait_for:语义相同(1ms 粒度),但 GCC 11 TSan 对
+  // timed cv wait 建模不全,会把跨线程锁序误报成 double-lock/race
+  // (20 行标准库最小复现实证);wait() 无超时版保留 cv 阻塞
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (true) {
+    const TaskState s = ctx_->state.load(std::memory_order_acquire);
+    if (isTerminal(s) || std::chrono::steady_clock::now() >= deadline) {
+      return s;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 bool TaskHandle::cancel() {
@@ -107,29 +115,37 @@ nlohmann::json TaskHandle::explain() const {
                                           ctx_->node_stats.get());
     } else if (core_) {
       // 快照状态必须共享:explain() 超时返回后 job 仍会(迟到)执行,
-      // 栈上引用会悬垂成 UB;job 与等待方经 shared_ptr 安全交接
+      // 栈上引用会悬垂成 UB;job 与等待方经 shared_ptr 安全交接。
+      // 等待用原子标志 + 轮询(1ms),不用 condition_variable::wait_for:
+      // GCC 11 TSan 对 timed cv 建模不全,会对该模式整链误报
       struct SnapState {
-        std::mutex mu;
-        std::condition_variable cv;
-        bool done = false;
+        std::mutex mu;                    // 只保护 snap
         nlohmann::json snap;
+        std::atomic<bool> done{false};
       };
       auto ctx = ctx_;
       auto st = std::make_shared<SnapState>();
       if (core_->scheduler.post([ctx, st] {
+            nlohmann::json snap;
             if (ctx->tree && ctx->tree->rootNode()) {
-              st->snap = detail::explainTreeNode(ctx->tree->rootNode(), "",
-                                                 ctx->node_stats.get());
+              snap = detail::explainTreeNode(ctx->tree->rootNode(), "",
+                                             ctx->node_stats.get());
             }
-            std::lock_guard<std::mutex> lk(st->mu);
-            st->done = true;
-            st->cv.notify_all();
+            {
+              std::lock_guard<std::mutex> lk(st->mu);
+              st->snap = std::move(snap);
+            }
+            st->done.store(true, std::memory_order_release);
           })) {
-        std::unique_lock<std::mutex> lk(st->mu);
         // 2s 上限:从调度线程自身调用时 job 无法执行(返回无树快照)
-        st->cv.wait_for(lk, std::chrono::seconds(2),
-                        [&] { return st->done; });
-        if (st->done) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!st->done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (st->done.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lk(st->mu);
           j["tree"] = std::move(st->snap);
         } else {
           j["tree_snapshot"] =

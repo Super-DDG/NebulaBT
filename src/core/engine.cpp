@@ -59,12 +59,17 @@ Engine::Engine(std::shared_ptr<VirtualClock> vclock)
   core_->factory.registerNodeType<WhileLoopNode>("WhileLoop");
   core_->factory.registerNodeType<SwitchNNode>("SwitchN");
 
-  // RetryWithDelay 需要延时唤醒:注入调度器与任务唤醒函数
-  auto core = core_;
+  // RetryWithDelay 需要延时唤醒:注入调度器与任务唤醒函数。
+  // 必须用 weak_ptr:factory 是 EngineCore 的成员,捕获 shared_ptr 会形成
+  // EngineCore→factory→lambda→EngineCore 引用环,每个引擎实例整体泄漏
+  // (ASan 泄漏报告抓到的真问题)。树创建时引擎必然存活,lock 失败即 no-op
+  auto weak = std::weak_ptr<detail::EngineCore>(core_);
   core_->factory.registerNodeType<RetryWithDelayNode>(
       "RetryWithDelay", &core_->scheduler,
-      [core](const std::string& taskId) {
-        core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+      [weak](const std::string& taskId) {
+        if (auto core = weak.lock()) {
+          core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+        }
       });
 
   // Checkpoint 需要读写任务的检查点历史与 journal:注入宿主(EngineCore)
@@ -76,10 +81,13 @@ Engine::Engine(std::shared_ptr<VirtualClock> vclock)
                                                    core_.get());
 
   // M5:ReactiveGuard 运行期守护(定时巡检经调度器,宿主记录违规)
+  // wake 同样用 weak_ptr 防 factory 引用环(见上)
   core_->factory.registerNodeType<ReactiveGuardNode>(
       "ReactiveGuard", &core_->scheduler,
-      [core](const std::string& taskId) {
-        core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+      [weak](const std::string& taskId) {
+        if (auto core = weak.lock()) {
+          core->scheduler.post([core, taskId] { core->tickTask(taskId); });
+        }
       },
       core_.get());
 
@@ -125,6 +133,7 @@ TaskHandle Engine::submitFromText(const std::string& xmlText, TaskSpec spec) {
   }
   std::shared_ptr<BT::Tree> tree;
   try {
+    std::lock_guard<std::mutex> lk(core_->create_mu);  // BT.CPP 共享解析器非并发安全
     tree = std::make_shared<BT::Tree>(
         core_->factory.createTreeFromText(xmlText));
   } catch (const std::exception& e) {
@@ -149,6 +158,7 @@ TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec,
   }
   std::shared_ptr<BT::Tree> tree;
   try {
+    std::lock_guard<std::mutex> lk(core_->create_mu);  // BT.CPP 共享解析器非并发安全
     tree = std::make_shared<BT::Tree>(
         core_->factory.createTreeFromFile(xmlPath));
   } catch (const std::exception& e) {
@@ -216,6 +226,7 @@ void Engine::loadPack(const std::string& manifestDir) {
                              task.tree + ".xml";
     std::shared_ptr<BT::Tree> tree;
     try {
+      std::lock_guard<std::mutex> lk(core_->create_mu);  // BT.CPP 共享解析器
       tree = std::make_shared<BT::Tree>(core_->factory.createTreeFromFile(path));
     } catch (const std::exception& e) {
       throw std::runtime_error("loadPack[" + manifest.name + " v" +
@@ -322,6 +333,7 @@ std::vector<std::string> Engine::validate(const std::string& xmlText,
   std::vector<std::string> errors;
   std::shared_ptr<BT::Tree> tree;
   try {
+    std::lock_guard<std::mutex> lk(core_->create_mu);  // BT.CPP 共享解析器
     tree = std::make_shared<BT::Tree>(
         core_->factory.createTreeFromText(xmlText));
   } catch (const std::exception& e) {

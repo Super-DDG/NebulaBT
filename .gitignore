@@ -1,4 +1,3 @@
-build/
 out/
 install/
 _deps/
@@ -7,3 +6,4 @@ compile_commands.json
 .vscode/
 .idea/
 .cache/
+build*

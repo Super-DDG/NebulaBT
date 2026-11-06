@@ -3,6 +3,41 @@
 All notable changes to NebulaBT are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased] - 测试加固(sanitizer / 覆盖率 / CLI / 并发)
+
+### Fixed
+
+- **EngineCore 引用环泄漏(ASan 抓获)**:注册 RetryWithDelay /
+  ReactiveGuard 的 wake lambda 捕获 `shared_ptr<EngineCore>`,而 factory
+  是 EngineCore 的成员——自环保守对象;改为 `weak_ptr` + EngineCore
+  外联析构(混合插桩边界下内联析构销毁路径有实证问题)。
+- **finished 事件竞态(ASan 慢时序抓获)**:终态 journal 事件在唤醒
+  `wait()` **之后**才落——调用方从 wait 返回即持久化会丢终态记录。
+  顺序改为:补偿 → finished 事件 → 唤醒。
+- **树创建并发竞争(并发压测抓获,TSan/ASan 不可见)**:BT.CPP
+  factory 内部持有共享 XMLParser,并发 `createTreeFromText/FromFile`
+  竞争它(Ok 任务偶发 FAILED)。Engine 以 `create_mu` 串行化四个创建点。
+- **tick 异常只进日志**:现在也记 `TICK_EXCEPTION` 结构化失败,explain
+  可检索(如 Compensable 子树数不符的构造错误)。
+- `TaskHandle::waitFor` 改原子轮询(1ms 粒度):GCC 11 TSan 对 timed
+  cv wait 建模不全(20 行标准库最小复现实证),轮询版语义不变且消除
+  整条误报链;`wait()` 无超时版保留 cv 阻塞。
+
+### Added
+
+- **sanitizer 三件套**:`NEBULABT_SANITIZE` CMake 选项(address /
+  undefined / thread);ASan/UBSan 10/10 全绿;TSan 报告为工具误报
+  (标准库最小复现论证,升级 GCC/clang 后复测)。
+- **覆盖率报告**:gcov 实测总体 89.98%,存 `docs/coverage.md`;
+  低覆盖项(failure/pack/checkpoint/journal_file 错误分支)列为补测目标。
+- **CLI 冒烟测试**(`nebulabt_cli`):validate 合法/非法/--json、
+  journal、replay(帧格式 + 撕裂尾 + --until)、doc。
+- **并发压测 + 析构时序**(`nebulabt_stress`):8 线程 × 50 任务并发
+  提交 + 观测 API 乱入;RUNNING 中销毁引擎;句柄跨引擎存活;
+  onFinished 回调内提交后续任务。
+- **边界单测**:Compensable 子树数不符、异步补偿触顶、LLM 客户端
+  抛异常 / done 重复回调、journal 损坏头(64MB 保护)、guard period=0。
+
 ## [Unreleased] - 代码审查修复批次(A1-A4 + B5/B6/B7)
 
 ### Fixed

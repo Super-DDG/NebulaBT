@@ -1767,6 +1767,145 @@ static void test_watchdog() {
   }
 }
 
+// ---- 测试加固:边界输入 ----
+static void test_boundaries() {
+  // 1) Compensable 子树数 != 2 → tick 抛 LogicError,任务 Failed 不崩
+  {
+    Engine engine;
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Compensable id="x"><Ok/></Compensable>
+      </BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(task.failures()[0].code == "TICK_EXCEPTION");  // 异常可检索,不只进日志
+  }
+
+  // 2) 异步补偿(补偿子树 RUNNING 不休止)→ 1000 tick 触顶 →
+  //    COMPENSATION_FAILED,不中断其余补偿,不挂死
+  {
+    class Stuck : public NebulaAction {
+    public:
+      BT::PortsList providedPorts() const override { return {}; }
+      NodeStatus start(NebulaCtx&, const Done&) override {
+        return NodeStatus::RUNNING;
+      }
+    };
+    Engine engine;
+    engine.registerAction("SideEffect", std::make_shared<SideEffect>());
+    engine.registerAction("Stuck", std::make_shared<Stuck>());
+    engine.registerAction("Failer", std::make_shared<Failer>());
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <Compensable id="reserve">
+            <SideEffect/>
+            <Stuck/>
+          </Compensable>
+          <Failer/>
+        </Sequence>
+      </BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Failed);
+    bool compensated = false;
+    for (const auto& f : task.failures()) {
+      if (f.code == "COMPENSATION_FAILED") compensated = true;
+    }
+    CHECK(compensated);
+  }
+
+  // 3) LLM 客户端同步抛异常 → ACTION_EXCEPTION
+  {
+    Engine engine;
+    LlmDecision::Client throwing = [](const nlohmann::json&, Done) {
+      throw std::runtime_error("llm endpoint down");
+    };
+    engine.registerAction("LLMDecision",
+                          std::make_shared<LlmDecision>(throwing));
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <LLMDecision prompt="x" branches="a,b" branch="{d}"/>
+      </BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(task.failures()[0].code == "ACTION_EXCEPTION");
+  }
+
+  // 4) LLM done 重复回调 → 只认第一次(桥的 slot 去重)
+  {
+    Engine engine;
+    auto observed = std::make_shared<std::string>();
+    class Observe : public NebulaAction {
+    public:
+      std::shared_ptr<std::string> out;
+      BT::PortsList providedPorts() const override {
+        return { BT::InputPort<std::string>("branch") };
+      }
+      NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        *out = ctx.in<std::string>("branch");
+        return NodeStatus::SUCCESS;
+      }
+    };
+    auto obs = std::make_shared<Observe>();
+    obs->out = observed;
+    engine.registerAction("Observe", obs);
+    LlmDecision::Client doubleDone = [](const nlohmann::json&, Done done) {
+      done(NodeStatus::SUCCESS, nlohmann::json{{"branch", "first"}});
+      done(NodeStatus::SUCCESS, nlohmann::json{{"branch", "second"}});
+    };
+    engine.registerAction("LLMDecision",
+                          std::make_shared<LlmDecision>(doubleDone));
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <LLMDecision prompt="x" branches="first,second" branch="{d}"/>
+          <Observe branch="{d}"/>
+        </Sequence>
+      </BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(*observed == "first");
+  }
+
+  // 5) journal 损坏头(len 超 64MB 保护上限)→ torn_tail + 前缀保留
+  {
+    const std::string path = "/tmp/nebulabt_bad_header.bin";
+    std::remove(path.c_str());
+    {
+      JournalFileWriter w;
+      CHECK(w.open(path, false));
+      JournalEvent e;
+      e.task_id = "t1"; e.event = "submitted";
+      CHECK(w.append(e));
+    }
+    {
+      std::ofstream f(path, std::ios::app | std::ios::binary);
+      // len = 0x7FFFFFFF(超 64MB 上限)+ 4 字节垃圾
+      const uint8_t bad[] = {0xFF, 0xFF, 0xFF, 0x7F, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
+      f.write(reinterpret_cast<const char*>(bad), sizeof(bad));
+    }
+    nlohmann::json arr;
+    JournalFileReadStats st;
+    CHECK(readJournalFile(path, arr, &st));
+    CHECK(arr.size() == 1);        // 完好前缀保留
+    CHECK(st.torn_tail);           // 损坏头被识别,不会超大分配
+    std::remove(path.c_str());
+  }
+
+  // 6) ReactiveGuard period_ms=0 → 钳到 1ms,不崩
+  {
+    Engine engine;
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    TaskSpec spec;
+    spec.slots["safe"] = true;
+    spec.schema = nlohmann::json{
+        {"slots", {{"safe", {{"type", "bool"}, {"required", true}}}}}};
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <ReactiveGuard while_true="{safe}" period_ms="0"><Ok/></ReactiveGuard>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Succeeded);
+  }
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -1833,6 +1972,9 @@ int main() {
   test_review_fixes();
   std::cout << "ok  review fixes (explain safety / logf reentry / crc constexpr /\n"
                "     advance guard / zombie submit / journal cap)\n";
+  test_boundaries();
+  std::cout << "ok  boundaries (comp children / async compensation / llm throw /\n"
+               "     double done / bad journal header / guard period=0)\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

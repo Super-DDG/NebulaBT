@@ -2,6 +2,20 @@ add_executable(nebulabt_tests test_core.cpp)
 target_link_libraries(nebulabt_tests PRIVATE nebulabt::nebulabt)
 add_test(NAME nebulabt_tests COMMAND nebulabt_tests)
 
+# 并发压力 + 引擎析构时序(测试加固)
+add_executable(nebulabt_stress test_stress.cpp)
+target_link_libraries(nebulabt_stress PRIVATE nebulabt::nebulabt)
+add_test(NAME nebulabt_stress COMMAND nebulabt_stress)
+
+# nebula CLI 冒烟(测试加固):需要 nebula 二进制路径
+if(NEBULABT_BUILD_TOOLS)
+  add_executable(nebulabt_cli_test test_cli.cpp)
+  target_link_libraries(nebulabt_cli_test PRIVATE nebulabt::nebulabt)
+  target_compile_definitions(nebulabt_cli_test PRIVATE
+      NEBULA_BIN="$<TARGET_FILE:nebula>")
+  add_test(NAME nebulabt_cli COMMAND nebulabt_cli_test)
+endif()
+
 # 树嵌入(M7):XML 编译进二进制,无文件系统提交
 include(nebulabt-embed)
 add_executable(nebulabt_embed_test test_embed.cpp)

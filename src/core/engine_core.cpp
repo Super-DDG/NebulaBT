@@ -6,6 +6,8 @@
 namespace nebulabt {
 namespace detail {
 
+EngineCore::~EngineCore() = default;
+
 void EngineCore::logf(LogLevel lv, const std::string& msg) {
   Engine::LogCallback cb;
   {
@@ -121,6 +123,15 @@ void EngineCore::tickTask(const std::string& id) {
   try {
     status = ctx->tree->tickOnce();
   } catch (const std::exception& e) {
+    // 结构化记录(此前只进日志):节点构造/校验抛错(如 Compensable
+    // 子树数不符)也要可被 explain 检索
+    FailureRecord fr;
+    fr.code = "TICK_EXCEPTION";
+    fr.node = id;
+    fr.node_type = "Engine";
+    fr.message = e.what();
+    fr.timestamp = nowTimestamp();
+    ctx->failures->add(std::move(fr));
     logf(LogLevel::Error, "task " + id + " tick exception: " + e.what());
     finishTask(ctx, TaskState::Failed, e.what());
     return;
@@ -154,14 +165,18 @@ void EngineCore::finishTask(std::shared_ptr<TaskContext> ctx, TaskState st,
     active.erase(ctx->task_id);
     task_resources.erase(ctx->task_id);  // M5:释放资源
   }
+
+  // finished 事件必须在唤醒 wait() **之前**落 journal:调用方从 wait()
+  // 返回即可能持久化 journal(恢复依据),迟到的终态事件会丢
+  // (ASan 慢时序下实证的竞态)
+  appendJournal(ctx, "finished",
+                nlohmann::json{{"state", toString(st)}, {"reason", reason}});
+
   {
     // 与 wait() 的谓词检查建立顺序,防止丢唤醒
     std::lock_guard<std::mutex> lk(ctx->wait_mu);
   }
   ctx->wait_cv.notify_all();
-
-  appendJournal(ctx, "finished",
-                nlohmann::json{{"state", toString(st)}, {"reason", reason}});
 
   logf(LogLevel::Info, "task " + ctx->task_id + " " + toString(st) +
                            (reason.empty() ? "" : " (" + reason + ")"));
