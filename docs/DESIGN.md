@@ -299,7 +299,42 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
   0 = 不限):触顶只影响 explain 内存视图,sink 落盘不受影响,但恢复
   依赖落盘 journal;触顶会告警一次
 
-## 7. 决策记录
+## 7. 代码组织规范
+
+### 目录结构
+
+```
+include/nebulabt/        公共头文件(随库安装,唯一对外接口面)
+  core/                  引擎核心 API(engine/task/scheduler/pack/
+                         journal/journal_file/failure/clock/schema)
+  sdk/                   节点作者 SDK(action.hpp:NebulaAction/NebulaCtx/Done)
+  nodes/                 内置节点(装饰器/控制节点/LLM 决策)
+  testkit/               测试工具(mock/inject;仅测试用,不随安装)
+src/                     实现(与 include 一一对应)
+  core/                  内部头(engine_core/task_context/bridge_node/
+                         node_stats/tree_check)不对外安装
+src/nodes/               节点实现
+tools/                   nebula CLI(validate/journal/replay/explain/doc)
+tests/                   测试(单测/压测/CLI 冒烟/性质/kill9)
+examples/                示例即测试
+benchmarks/              性能基准(docs/benchmarks.md 记录基线)
+scripts/                 辅助脚本(coverage.py 等)
+docs/                    设计文档 + adr/
+```
+
+### 头/源分离规则
+
+- **声明进 .hpp,实现进 .cpp**——公共头里只允许声明、文档注释与默认值。
+  内部头(`src/core/*.hpp`)同规则。
+- **豁免**(仅限以下形态,新增豁免需在此登记):
+  - 模板:`sdk/action.hpp` 的 `in<T>/out<T>`、`core/any_json.hpp` 的
+    `anyToJson`——模板必须在头文件实例化
+  - 琐碎内联:`core/clock.hpp` 的时钟单行读/推进
+  - 纯测试便利:`testkit/*.hpp` header-only(单头即用是测试库惯例,
+    不随库安装)
+- 全部头文件使用 `#pragma once`;节点注册名与文件名一一对应。
+
+## 8. 决策记录
 
 所有重要设计决策见 [docs/adr/](adr/)。当前:
 

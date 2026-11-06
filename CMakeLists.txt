@@ -76,6 +76,7 @@ add_library(nebulabt
   src/nodes/checkpoint.cpp
   src/nodes/compensable.cpp
   src/nodes/for_each.cpp
+  src/nodes/llm_decision.cpp
   src/nodes/reactive_guard.cpp
   src/nodes/retry_with_delay.cpp
   src/nodes/switch_n.cpp
