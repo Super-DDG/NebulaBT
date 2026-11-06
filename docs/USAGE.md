@@ -22,6 +22,7 @@
 13. [线程模型](#13-线程模型)
 14. [错误码约定](#14-错误码约定)
 15. [最佳实践与反模式](#15-最佳实践与反模式)
+16. [Agent 骨架:LLM 提议,守护裁决](#16-agent-骨架llm-提议守护裁决)
 
 ---
 
@@ -85,8 +86,11 @@ cmake --build build -j
 cd build && ctest --output-on-failure
 ```
 
-可选开关:`NEBULABT_BUILD_EXAMPLES` / `NEBULABT_BUILD_TESTS` / `NEBULABT_BUILD_TOOLS`(默认 ON);
-`NEBULABT_BT_CPP_SOURCE_DIR` 指向本地 BehaviorTree.CPP 源码(离线构建)。
+可选开关:`NEBULABT_BUILD_EXAMPLES` / `NEBULABT_BUILD_TESTS` /
+`NEBULABT_BUILD_TOOLS` / `NEBULABT_BUILD_BENCH`(默认 ON);
+`NEBULABT_BT_CPP_SOURCE_DIR` 指向本地 BehaviorTree.CPP 源码(离线构建);
+`NEBULABT_SANITIZE=address|undefined|thread` 出消毒器构建(测试加固,
+性能基线见 [benchmarks.md](benchmarks.md))。
 
 ---
 
@@ -312,6 +316,9 @@ spec.schema    = json::object();        // 加载期校验(见 §7);空 = 不校
 spec.timeout_ms = 60000;                // 任务级超时;超时 halt + TASK_TIMEOUT
 spec.resume_journal = json::array();    // 断点恢复(见 §9)
 spec.pack_version = "1.2.0";            // 显式钉住树包版本(可选)
+spec.watchdog_ms = 5000;                // 卡死检测(见 6.5);0 = 跟随引擎默认
+spec.resources = {"gripper", "bin_3"};  // 互斥资源声明(见 6.6);冲突提交被拒
+spec.groot2_port = 1667;                // Groot2 实时可视化(0 = 关,默认)
 ```
 
 ### 6.2 slots 注入规则
@@ -345,6 +352,42 @@ task.explain();                    // 完整执行报告(见 §8)
 
 engine.onFinished([](TaskHandle t) { /* 终态回调,调度线程执行,应快速返回 */ });
 ```
+
+### 6.5 watchdog:卡死检测(M4)
+
+崩溃可恢复,卡死必须可发现。任务 RUNNING 期间**无任何节点状态迁移**超过阈值
+→ 告警回调;可选 halt + `TASK_WATCHDOG` 终态:
+
+```cpp
+engine.setWatchdog(std::chrono::milliseconds(5000),
+                   /*halt_on_trigger=*/true,            // false = 只告警
+                   [](const std::string& task_id, uint64_t quiet_ms) {
+                     alertOps("task " + task_id + " stuck for " +
+                              std::to_string(quiet_ms) + " ms");
+                   });
+// 单任务覆盖:spec.watchdog_ms(引擎默认之上的例外)
+```
+
+同一静默期只触发一次;活动恢复自动重新武装。典型用法:机器人任务卡在
+失联的硬件调用上,watchdog 先于客户投诉发现。
+
+### 6.6 资源上限与互斥(M4/M5)
+
+长期运行服务的内存必须可预算:
+
+```cpp
+EngineLimits limits;
+limits.max_active_tasks   = 64;    // 活动任务上限(超限提交拒绝)
+limits.max_pending_jobs   = 1024;  // 调度队列上限(失控回调风暴被拒)
+limits.max_pending_timers = 256;   // 定时器上限
+limits.max_journal_events = 1000;  // 单任务内存 journal 上限(0=不限;
+                                   // 触顶告警,sink 落盘不受影响)
+engine.setLimits(limits);
+```
+
+任务级互斥:声明 `spec.resources = {"gripper"}`,与任一活动任务声明集
+有交集 → 提交被拒绝(返回空句柄);任务终态自动释放。防"两个任务同时
+抓同一个包裹"。
 
 ---
 
@@ -397,31 +440,79 @@ error: node 'ForEach' port 'array' reads undeclared blackboard key 'locaitons'
 }
 ```
 
-> 注意:请在任务**终态后**调用 explain()(RUNNING 期间调用树结构遍历无锁)。
+> M7 起任务 **RUNNING 期间调用 explain() 也安全**:树遍历经调度线程
+> 快照完成(2s 上限,调度线程自调用或队列满时降级为
+> `tree_snapshot: unavailable`)——排障恰好发生在任务卡住时最需要它。
 
 ### 8.2 结构化失败
 
 - 节点里 `ctx.fail(code, msg)`;忘了调?框架自动兜底记 `NODE_FAILURE`
+- 失败自动富化(M7):每条记录附带激活时刻的**输入端口快照**,排障不用猜"当时参数是什么"
+- 异步回调线程无法安全访问 ctx?done 结果携带保留键
+  `{"__fail_code": "...", "__fail_message": "..."}`,桥在调度线程代记——
+  见 LlmDecision 的用法
 - 建议错误码全大写下划线:`NAV_TIMEOUT` / `PAY_DECLINED`;同一框架内保持词表一致
+
+### 8.2.1 失败码登记表(M8)
+
+失败码是接口,先声明后使用:
+
+```cpp
+engine.declareFailureCodes({
+  {"NAV_TIMEOUT",     "navigation exceeded time budget"},
+  {"PAY_DECLINED",    "payment provider declined the charge"},
+});
+// pack 清单也可声明:task_types.XXX.failure_codes = { "NAV_TIMEOUT": "..." }
+```
+
+登记表启用后,`ctx.fail` 用了未登记的码 → 该条 FailureRecord 标记
+`undeclared_code: true`(explain 可筛出拼写错误)。表为空 = 不校验。
 
 ### 8.3 journal
 
-事件类型:`submitted → started → checkpoint → finished`(恢复时含 `checkpoint_restored`)。
+事件类型:`submitted → started → checkpoint → finished`(恢复时含
+`checkpoint_restored`,失败含 `compensation_*` / `guard_violated`)。
+
+**落盘推荐走帧格式**(M4,掉电安全):每事件一帧
+`[u32 len][u32 crc32][payload]`,崩溃瞬间最多损坏最后一帧,读取容错
+截断到完好前缀并标记 `torn_tail`:
 
 ```cpp
-engine.setJournalSink([](const JournalEvent& e) {
-  file << nlohmann::json(e).dump() << "\n";   // 每事件一行 JSON;落盘即持久化
-});
+#include <nebulabt/core/journal_file.hpp>
+
+nebulabt::JournalFileWriter w;
+w.open("run.bin", /*append=*/false,
+       nebulabt::JournalFsync::PerEvent);       // Never = 只 fflush(flash 友好)
+engine.setJournalSink([&w](const JournalEvent& e) { w.append(e); });
+
+// 恢复侧:读回完好前缀,直接作为 resume_journal
+nlohmann::json events;
+nebulabt::JournalFileReadStats st;
+nebulabt::readJournalFile("run.bin", events, &st);   // st.torn_tail = 掉电窗口
 ```
+
+裸 JSONL sink(逐行 `dump()`)仍可用,但掉电窗口内的半行只能靠解析容错。
 
 ### 8.4 CLI
 
 ```bash
-nebula validate <tree.xml> [schema.json]   # 加载期校验 → CI 门禁
-nebula journal  <file.jsonl>               # 检查落盘 journal(坏行统计/事件分布/检查点清单)
-nebula explain  <file.jsonl> [task_id]     # 事后分析:时间线+终态+崩溃识别
-nebula doc      <tree.xml>                 # 树 → mermaid 流程图(评审/交接)
+nebula validate <tree.xml> [schema.json] [--json]  # 加载期校验 → CI 门禁;
+                                                   # --json 机器可读(LLM 反馈闭环)
+nebula journal  <file>            # 检查落盘 journal(帧/JSONL 自适应;
+                                  # 坏行统计/事件分布/检查点清单)
+nebula replay   <file> [--until N] # 恢复态预演:哪些检查点会被跳过、
+                                   # 恢复哪些黑板键、上轮终态;--until 时间旅行
+nebula explain  <file> [task_id]  # 事后分析:时间线+终态+崩溃识别
+nebula doc      <tree.xml>        # 树 → mermaid 流程图(评审/交接)
 ```
+
+### 8.5 Groot2 实时可视化(M7)
+
+```cpp
+spec.groot2_port = 1667;   // 提交时开启;端口被占用只告警不影响任务
+```
+用 [Groot2](https://www.behaviortree.cc/) 连接即可实时观看树执行
+(需要 BT.CPP 编译时开启 GROOT_INTERFACE)。
 
 ---
 
@@ -531,6 +622,30 @@ CHECK(nav->calls()[0]["point_id"] == "kitchen");
 
 建议的最小测试矩阵:金路径 / 每个失败分支的兜底 / 重试挽回 / 取消 / 超时 / 恢复重跑副作用不重复。
 
+### 11.1 故障注入(M6):不改生产代码
+
+```cpp
+#include <nebulabt/testkit/inject.hpp>
+
+engine.registerAction("ChargePayment",
+    nebulabt::testkit::flaky(realPaymentAction, /*fail_first=*/2));
+// 前 2 次激活失败(INJECTED_FAILURE),之后透传真实动作;
+// 计数跨 Engine 存活——同一实例可用于"崩溃 → 恢复多轮"的故障贯穿
+```
+
+### 11.2 虚拟时钟(M6):时间敏感场景零等待
+
+```cpp
+auto clock = std::make_shared<nebulabt::VirtualClock>();
+nebulabt::Engine engine(clock);        // 虚拟时钟模式
+auto task = engine.submitFromText(retryXml, spec);   // RetryWithDelay delay_ms=1000
+engine.advanceTime(1000);              // 重试即刻到期,测试不真睡
+```
+
+超时/watchdog/重试延时/活动戳全部走注入时钟;journal 时间戳仍为真实墙钟。
+配套 `tests/test_property_recovery`:随机虚拟时间推进 × 崩溃 × 恢复 ×
+200 轮,断言检查点副作用恰好一次——恢复逻辑的混沌测试。
+
 ---
 
 ## 12. 内置节点参考
@@ -544,6 +659,21 @@ CHECK(nav->calls()[0]["point_id"] == "kitchen");
 | `SwitchN` | variable, case_1..case_32 | 分发;default 恒为最后一个子节点 |
 | `RetryWithDelay` | attempts, delay_ms, budget_ms | 重试;次数与墙钟任一用尽即失败 |
 | `Checkpoint` | id | 子节点成功后拍全量黑板快照;恢复时跳过并还原 |
+| `Compensable` | id | **双子:[主工作, 补偿]**。主工作 SUCCESS 即武装;任务 FAILED 时引擎**逆序自动执行**已武装补偿(超时路径同,取消不触发);补偿失败记 `COMPENSATION_FAILED` 并继续逆序 |
+| `ReactiveGuard` | while_true, period_ms(默认 100) | 运行期守护:进入前与子树 RUNNING 期间持续检查黑板 bool 键;false/缺失(fail-closed)→ halt 子树 + `GUARD_VIOLATED` + FAILURE。安全区/e-stop 刚需 |
+| `LLMDecision` | prompt, branches, branch(out), reason(out) | LLM 只做"选分支":客户端经能力接口注入(核心零 HTTP 依赖);输出不在 branches 集合内 → `LLM_INVALID_BRANCH`(幻觉拦在节点边界)。见 §16 |
+
+`Compensable` 用法(Saga:扣了 A、B 失败,忘补偿 A 在结构上不可能发生):
+
+```xml
+<Sequence>
+  <Compensable id="reserve">
+    <ReserveStock/>          <!-- 主工作(有副作用) -->
+    <ReleaseStock/>          <!-- 补偿:正常运行永不执行;声明即生效 -->
+  </Compensable>
+  <Ship/>                    <!-- 这里失败 → 引擎自动逆序补偿 -->
+</Sequence>
+```
 
 ### BT.CPP 4.9 内置(常用子集)
 
@@ -558,10 +688,13 @@ CHECK(nav->calls()[0]["point_id"] == "kitchen");
 ## 13. 线程模型
 
 - **调度线程**:唯一的树 tick 执行线程;所有节点 `start`/`halt` 都在其中
-- **`done` 回调**:可在**任意线程**调用;框架自动投递唤醒,结果类型化写回端口
+- **`done` 回调**:可在**任意线程**调用;框架自动投递唤醒,结果类型化写回端口;
+  跨线程失败走 `__fail_code` 保留键,不要在回调线程里触碰 ctx
 - **不需要锁**:节点内部状态只在调度线程被触碰(除非你在自己的异步线程里读写共享业务对象——那是你的锁)
-- **线程安全承诺**:TaskHandle 的 state/failures/journal/explain 数据部分、Engine 的注册与提交
-- **非线程安全**:`explain()` 的树结构遍历(任务 RUNNING 期间调用有竞争——终态后调用)
+- **线程安全承诺**:TaskHandle 的 state/failures/journal/explain、
+  Engine 的注册与提交(内部已串行化树创建;多引擎实例之间天然并行)
+- **explain()**:RUNNING 期间安全(M7 调度线程快照);唯调度线程自调用
+  会降级为无树快照
 - **Engine 析构**:自动取消全部活动任务并排空调度器,`wait()` 不会挂死
 
 ---
@@ -572,11 +705,18 @@ CHECK(nav->calls()[0]["point_id"] == "kitchen");
 |---|---|---|
 | `NODE_FAILURE` | 框架 | 动作返回 FAILURE 但未调 `ctx.fail()`(兜底) |
 | `ACTION_EXCEPTION` | 框架 | `start` 内抛出未捕获异常 |
+| `TICK_EXCEPTION` | 框架 | 树 tick 抛出异常(如 Compensable 子树数不符) |
 | `TASK_TIMEOUT` | 框架 | 任务级超时触发 |
+| `TASK_WATCHDOG` | 框架 | watchdog 静默超限且 halt_on_trigger 开启 |
+| `GUARD_VIOLATED` | 框架 | ReactiveGuard 条件破坏(fail-closed) |
+| `COMPENSATION_FAILED` | 框架 | 补偿子树未成功;不影响其余补偿继续 |
+| `LLM_INVALID_BRANCH` | 框架 | LLM 输出不在允许分支集(幻觉拦截) |
+| `LLM_NO_BRANCHES` | 框架 | LLMDecision 的 branches 端口为空 |
 | `PORT_OUTPUT_ERROR` | SDK | `ctx.out` 写端口失败(端口未声明等) |
-| 你的业务码 | 你 | 建议全大写下划线:`NAV_TIMEOUT` / `PAY_DECLINED` |
+| 你的业务码 | 你 | 全大写下划线;**建议进登记表**(见 8.2.1) |
 
-终态 reason 参照:`tree returned FAILURE` / `task timeout` / `canceled by request`。
+终态 reason 参照:`tree returned FAILURE` / `task timeout` /
+`task watchdog` / `canceled by request`。
 
 ---
 
@@ -598,7 +738,54 @@ CHECK(nav->calls()[0]["point_id"] == "kitchen");
 3. **不把一棵树写成 300 行**——层级化:子树 + 端口参数化,单屏能读完一棵树
 4. **不用黑板当全局变量转储**——键要进 schema,数据流要能从树上读出来
 5. **不让非幂等节点裸露在 Checkpoint 之外**再谈恢复
-6. **不在 RUNNING 期间调 explain()**——终态后调用
+6. **不手写补偿分支**——用 `Compensable` 声明,让引擎逆序执行
+7. **不在回调线程里触碰 ctx**——跨线程失败走 `__fail_code` 保留键
+
+---
+
+## 16. Agent 骨架:LLM 提议,守护裁决(M8)
+
+LLM 决策纳入结构化控制流——**LLM 只做"选分支",控制流仍在树里**:
+
+```cpp
+#include <nebulabt/nodes/llm_decision.hpp>
+
+// 能力接口注入你的 LLM 客户端(核心库零 HTTP 依赖)
+LlmDecision::Client client = [](const nlohmann::json& req, Done done) {
+  myLlm.complete(req.dump(), [done](std::string text) {   // 任意线程
+    done(BT::NodeStatus::SUCCESS, nlohmann::json::parse(text));
+  });
+};
+engine.registerAction("LLMDecision", std::make_shared<LlmDecision>(client));
+```
+
+```xml
+<Sequence>
+  <SenseWorld situation="{situation}" in_combat="{in_combat}"/>
+  <LLMDecision prompt="{situation}" branches="patrol,engage,retreat"
+               branch="{decision}" reason="{why}"/>
+  <SwitchN variable="{decision}" case_1="patrol" case_2="engage" case_3="retreat">
+    <WhileLoop>...</WhileLoop>
+    <ReactiveSequence>                                  <!-- 守护段 -->
+      <SenseWorld in_combat="{in_combat}"/>             <!-- 每 tick 刷新感知 -->
+      <ReactiveGuard while_true="{in_combat}" period_ms="30">
+        <Engage/>                                       <!-- 条件破坏即 halt -->
+      </ReactiveGuard>
+    </ReactiveSequence>
+    <Retreat/>
+  </SwitchN>
+</Sequence>
+```
+
+这个组合的性质(完整可跑示例见 `examples/game_npc` 场景 E):
+
+- **幻觉拦截**:输出不在 branches 集合 → `LLM_INVALID_BRANCH`,污染不了控制流
+- **守护裁决**:决策不可信的前提是守护条件持续成立——玩家撤离时
+  ReactiveGuard 否决 LLM 的 engage 决策、halt 在途工作(`GUARD_VIOLATED`)
+- **可恢复/可审计**:Checkpoint 让长 agent 任务崩溃后续跑;explain 输出
+  决策 + 违规的完整证据链(LLM 决策不可复现,轨迹是唯一审计依据)
+- **生成护栏**:`nebula validate --json` 输出机器可读错误——
+  LLM 生成树草稿 → 校验 → 错误回灌修复 → 人审入库
 
 ---
 

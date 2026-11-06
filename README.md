@@ -1,5 +1,7 @@
 # NebulaBT · 星云树
 
+[![ci](https://github.com/Super-DDG/NebulaBT/actions/workflows/ci.yml/badge.svg)](https://github.com/Super-DDG/NebulaBT/actions/workflows/ci.yml)
+
 **Collapse chaos into order.**
 
 > 星云,是宇宙中最混沌的物质;它坍缩,才成为恒星。
@@ -22,11 +24,14 @@ that solution usable for everyone else.
 |---|---|
 | Write business, not glue | C++17 callback-continuation nodes; async is native, no polling |
 | Fail at load time, not at 3 a.m. | Typed blackboard + tree ↔ schema cross-validation |
-| Failures speak human | Structured failure records + `explain(task_id)` reconstructs "why did this request take that path" |
-| Safety you cannot forget | Timeouts, retry budgets and cancel propagation wrapped by the engine, not by authors |
-| A crash is not the end | Event journal + checkpoints + idempotency → resume |
+| Failures speak human | Structured failure records with input snapshots + `explain(task_id)`; declared failure-code registry flags typos |
+| Safety you cannot forget | Timeouts, retry budgets, watchdogs, cancel propagation and resource limits wrapped by the engine, not by authors |
+| A crash is not the end | Power-safe journal (length-prefixed + CRC, torn-tail tolerant) + checkpoints + idempotency → resume |
+| Compensation you cannot forget to write | `Compensable`: declare the undo next to the do; the engine runs them in reverse on failure (Saga) |
+| Guards that hold while you run | `ReactiveGuard`: a blackboard condition re-checked for the whole subtree; violation halts it (e-stop, safety zones) |
 | Trees are assets, not copies | Template trees + instance overrides; versioned tree packs |
-| Testing is recording | Mocks generated from the same capability interface; replay production journals as regression tests |
+| Testing is recording | Mocks and fault injection from the same capability interface; virtual clock; 200-round randomized crash/recovery property tests |
+| An agent skeleton, guarded | `LLMDecision`: the LLM only picks a branch; hallucinations stop at the node boundary; a guard can veto mid-flight |
 | One picture for the product team | Trees generate their own flow documentation |
 
 ## Architecture
@@ -153,9 +158,11 @@ deterministic task-id hash; recovery replays pin the original version.
 ## CLI
 
 ```
-nebula validate <tree.xml> [schema.json]   # load-time validation (CI gate)
-nebula journal  <journal.jsonl>            # inspect persisted journals
-nebula explain  <journal.jsonl> [task_id]  # post-mortem: timeline, checkpoints, outcome
+nebula validate <tree.xml> [schema.json] [--json]  # load-time validation (CI gate);
+                                                   # --json is machine-readable (LLM feedback loop)
+nebula journal  <file>                     # inspect persisted journals (frame format / JSONL)
+nebula replay   <file> [--until N]         # resume dry-run: which checkpoints skip, what restores
+nebula explain  <file> [task_id]           # post-mortem: timeline, checkpoints, outcome
 nebula doc      <tree.xml>                 # tree -> mermaid flowchart
 ```
 
@@ -165,16 +172,20 @@ nebula doc      <tree.xml>                 # tree -> mermaid flowchart
 |---|---|---|
 | [hello_tree](examples/hello_tree) | any | 5-minute quick start: sync + async nodes, ForEach, explain |
 | [robot_delivery](examples/robot_delivery) | robotics | data-driven search (N copies → 1), checkpoints, kill-resume, tree pack + schema |
-| [game_npc](examples/game_npc) | games | ReactiveFallback priority brain, WhileLoop patrol, SwitchN by personality, async animation |
-| [order_fulfillment](examples/order_fulfillment) | backend | payment fallback chains, retry wall-clock budget, compensation on failure, schema-validated orders |
+| [game_npc](examples/game_npc) | games | ReactiveFallback priority brain, WhileLoop patrol — and scenario E: LLM-driven decisions where a ReactiveGuard **vetoes the LLM mid-engage** when the player flees |
+| [order_fulfillment](examples/order_fulfillment) | backend | payment fallback chains, retry wall-clock budget, Saga compensation via `Compensable`, schema-validated orders |
 
 Every example asserts its outcomes and runs as a CTest case — they are living
 documentation, not screenshots.
 
 ## Status
 
-**1.0.0** — the core feature set is complete and regression-tested
-(21 test cases, including a real fork + `SIGKILL` recovery test).
+Core feature set complete (M0–M8) and hardened: 10 test programs
+(unit, concurrency stress, CLI smoke, embedded trees, 200-round randomized
+crash/recovery property test, and a real fork + `SIGKILL` recovery test),
+green under ASan/UBSan in CI, ~90% line coverage
+([report](docs/coverage.md)), and a recorded performance baseline
+(~630 ns/tick, [benchmarks](docs/benchmarks.md)).
 See the [roadmap](docs/DESIGN.md#roadmap) for what's next.
 
 Explicit non-goals: not a BPMN / human-workflow engine, not a rules engine,
