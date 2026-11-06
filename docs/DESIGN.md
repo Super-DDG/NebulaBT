@@ -281,6 +281,13 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
   但掉电窗口内的半行只能靠解析容错
 - FailureRecord.attempt 暂未由 RetryWithDelay 自动填充(记录粒度到节点级)
 - `ForEachNode` 仅支持 string 集合;结构化元素待后续类型系统
+- 补偿子树内不要再嵌 Compensable(嵌套补偿在 runCompensations 弹栈后
+  入栈,条目无人消费;Saga 一层语义通常足够)
+- `NebulaCtx` 非线程安全:仅在 start/halt 调用栈内使用;跨线程失败
+  经 Done 的 `__fail_code` 保留键由桥代记
+- 单任务内存 journal 上限 `EngineLimits.max_journal_events`(默认 1000,
+  0 = 不限):触顶只影响 explain 内存视图,sink 落盘不受影响,但恢复
+  依赖落盘 journal;触顶会告警一次
 
 ## 7. 决策记录
 

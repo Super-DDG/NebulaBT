@@ -3,6 +3,34 @@
 All notable changes to NebulaBT are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased] - 代码审查修复批次(A1-A4 + B5/B6/B7)
+
+### Fixed
+
+- **A1(UB)**:explain() 的快照 job 按引用捕获栈上局部变量——超时返回后
+  job 迟到执行(或引擎析构 drain 队列时)写悬垂引用。改为 shared_ptr
+  共享状态安全交接。
+- **A4**:explain() 的 post 被拒(队列满/引擎已停止)时不再白等 2s,
+  立即降级返回 `tree_snapshot: unavailable`。
+- **A2(死锁)**:`logf` 持 mu 锁调用用户 logger——logger 内重入任何
+  Engine API 即死锁。改为先拷贝回调、锁外调用(与 journal_sink/
+  on_finished 同款)。
+- **A3(数据竞争)**:journal 帧格式 CRC32 查表为运行期惰性初始化,
+  写侧/读侧首次并发调用存在竞态。改为编译期 constexpr 表。
+- **B5(死锁)**:`advanceVirtualTime` 从调度线程自身调用(如动作内调
+  `engine.advanceTime`)会在两阶段等待上无限自死锁。增加调度线程
+  自调用防护,拒绝并告警。
+- **B6(僵尸任务)**:提交的首次 tick 投递被拒(队列满/已停止)时,
+  任务停在 Queued 永不执行却占用 active 槽位与资源名额。现在撤销
+  注册并返回空句柄。
+- **B7(静默数据丢失)**:单任务内存 journal 1000 条上限静默截断——
+  长任务超限后新检查点不落内存,恢复时已完成段被重执行。上限改为
+  `EngineLimits.max_journal_events`(0 = 不限),触顶告警一次;
+  sink 落盘不受影响。
+- 顺带:消除 4 处 `[[nodiscard]]` 编译告警,移除失效常量 kJournalMax。
+
+每项修复均配回归测试(test_review_fixes)。
+
 ## [Unreleased] - M8 Agent 骨架
 
 ### Added

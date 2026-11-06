@@ -158,8 +158,8 @@ void BridgeNode::initCtx() {
   std::string taskType;
   nlohmann::json inputs = nlohmann::json::object();
   if (auto bb = config().blackboard) {
-    bb->get("task_id", taskId);      // bool 版 get,失败保持默认值
-    bb->get("task_type", taskType);
+    (void)bb->get("task_id", taskId);  // 失败保持默认值
+    (void)bb->get("task_type", taskType);
   }
   // 输入端口快照(激活时刻):{key} 引用解析黑板值,字面量保持 string
   for (const auto& [port, remap] : config().input_ports) {

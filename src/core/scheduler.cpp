@@ -106,6 +106,11 @@ bool Scheduler::advanceVirtualTime(uint64_t ms) {
     if (!vclock_ || stopped_ || draining_) {
       return false;
     }
+    if (std::this_thread::get_id() == loop_tid_) {
+      // 从调度线程自身调用(如动作内部调 engine.advanceTime):
+      // 两阶段"等队列排空"会等自己,无限死锁——直接拒绝
+      return false;
+    }
   }
   // 相位 1:在"当前"虚拟时刻排空已排队作业(如 submit 的首次 tick)。
   // 否则它们会在时钟推进后才执行,活动戳等时间观测被记到未来
@@ -163,6 +168,7 @@ void Scheduler::drainAndStop() {
 
 void Scheduler::loop() {
   std::unique_lock<std::mutex> lk(mu_);
+  loop_tid_ = std::this_thread::get_id();
   while (true) {
     if (stopped_) {
       return;

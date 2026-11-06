@@ -82,6 +82,7 @@ private:
   std::deque<Job> jobs_;
   std::priority_queue<Timer, std::vector<Timer>, TimerCmp> timers_;
   uint64_t timer_seq_ = 0;
+  std::thread::id loop_tid_{};       // mu_ 保护;调度线程自调用防护
   size_t max_jobs_ = 0;              // mu_ 保护;0 = 不限
   size_t max_timers_ = 0;            // mu_ 保护;0 = 不限
   bool stopped_ = true;              // mu_ 保护

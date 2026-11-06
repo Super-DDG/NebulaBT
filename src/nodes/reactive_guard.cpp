@@ -26,7 +26,7 @@ BT::PortsList ReactiveGuardNode::providedPorts() {
 std::string ReactiveGuardNode::taskIdFromBlackboard() const {
   std::string taskId;
   if (auto bb = config().blackboard) {
-    bb->get("task_id", taskId);
+    (void)bb->get("task_id", taskId);
   }
   return taskId;
 }

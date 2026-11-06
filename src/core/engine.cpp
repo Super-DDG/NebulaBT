@@ -455,7 +455,19 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
                           !spec.resume_journal.empty()}});
   auto core = core_;
   auto id = spec.task_id;
-  core_->scheduler.post([core, id] { core->tickTask(id); });
+  if (!core_->scheduler.post([core, id] { core->tickTask(id); })) {
+    // 首次 tick 投递被拒(队列满/已停止):撤销注册,不留僵尸 Queued
+    // 任务占着 active 槽位和资源名额
+    {
+      std::lock_guard<std::mutex> lk(core_->mu);
+      core_->active.erase(spec.task_id);
+      core_->task_resources.erase(spec.task_id);
+    }
+    core_->logf(LogLevel::Error,
+                "submit rejected: scheduler queue full or stopped (task '" +
+                    spec.task_id + "')");
+    return TaskHandle();
+  }
 
   // 策略:任务级超时(调度线程回调;到点未终态则 halt + TASK_TIMEOUT)
   if (spec.timeout_ms > 0) {

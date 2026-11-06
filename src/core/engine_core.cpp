@@ -7,8 +7,14 @@ namespace nebulabt {
 namespace detail {
 
 void EngineCore::logf(LogLevel lv, const std::string& msg) {
-  std::lock_guard<std::mutex> lk(mu);
-  if (log) log(lv, msg);
+  Engine::LogCallback cb;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    cb = log;
+  }
+  // 锁外回调(与 journal_sink/on_finished 同款):logger 内重入
+  // Engine API(setLogger/submitTask/…)不死锁
+  if (cb) cb(lv, msg);
 }
 
 // ---- journal ----
@@ -22,13 +28,28 @@ void EngineCore::appendJournal(const std::shared_ptr<TaskContext>& ctx,
   e.event = event;
   e.data = std::move(data);
   Engine::JournalSink sink;
+  size_t cap = 0;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    sink = journal_sink;
+    cap = limits.max_journal_events;
+  }
+  bool capped = false;
   {
     std::lock_guard<std::mutex> lk(ctx->journal_mu);
-    if (ctx->journal.size() < TaskContext::kJournalMax) {
+    if (cap == 0 || ctx->journal.size() < cap) {
       ctx->journal.push_back(e);
+    } else {
+      capped = true;  // 内存上限:sink 落盘不受影响,丢的只是 explain 视图
     }
-    std::lock_guard<std::mutex> lk2(mu);
-    sink = journal_sink;
+  }
+  if (capped && !ctx->journal_capped.exchange(true)) {
+    // 触顶必须可发现:静默截断会丢检查点事件,恢复时已完成段被重执行
+    logf(LogLevel::Warn,
+         "task " + ctx->task_id + " in-memory journal capped at " +
+             std::to_string(cap) +
+             " events (sink still receives all; raise "
+             "EngineLimits.max_journal_events if resume matters)");
   }
   if (sink) {
     sink(e);  // 锁外回调,避免死锁

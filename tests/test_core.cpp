@@ -1176,6 +1176,165 @@ static void test_m7_observability() {
   }
 }
 
+// ---- 代码审查修复批次:A1-A4 + B5/B6/B7 ----
+static void test_review_fixes() {
+  // A2:logger 重入 Engine API 不死锁(旧代码 logf 持锁回调)
+  {
+    Engine engine;
+    std::atomic<int> logCalls{0};
+    engine.setLogger([&engine, &logCalls](LogLevel, const std::string&) {
+      logCalls.fetch_add(1);
+      engine.setLogger([](LogLevel, const std::string&) {});
+    });
+    engine.registerAction("Boom", std::make_shared<Boom>());
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Boom/></BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Failed);
+    CHECK(logCalls.load() >= 1);  // 没卡死且确实经过了 logger
+  }
+
+  // A1+A4+B6:调度线程被占住时 ——
+  //   explain 超时返回后迟到 job 无 UB(A1)、队列满 explain 立即降级(A4)、
+  //   首次 tick 投递被拒的提交不留僵尸任务(B6)
+  {
+    class Block2s : public NebulaAction {
+    public:
+      BT::PortsList providedPorts() const override { return {}; }
+      NodeStatus start(NebulaCtx&, const Done&) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2300));
+        return NodeStatus::SUCCESS;
+      }
+    };
+    Engine engine;
+    engine.registerAction("Block2s", std::make_shared<Block2s>());
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    EngineLimits lim;
+    lim.max_pending_jobs = 1;
+    engine.setLimits(lim);
+    engine.setLogger([](LogLevel, const std::string&) {});  // 静音拒绝告警
+
+    auto tA = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Block2s/></BehaviorTree></root>)");
+    CHECK(bool(tA));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));  // A 执行中,队列空
+
+    // A1:A 占住调度线程,快照 job 无法执行 → 2s 超时返回;
+    // 旧代码此时 job 悬垂,稍后执行即 UB
+    auto t0 = std::chrono::steady_clock::now();
+    auto j1 = tA.explain();
+    const auto d1 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    CHECK(d1 >= 1500);                 // 走的是超时路径
+    CHECK(j1.contains("tree_snapshot"));  // 降级而非崩溃
+    CHECK(!j1.contains("tree"));
+
+    // B6:队列被快照 job 占满,新任务首次 tick 投递被拒 → 空句柄,不留僵尸
+    auto tB = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Ok/></BehaviorTree></root>)");
+    CHECK(!tB);
+
+    // A4:队列满,explain 的 post 被拒 → 立即降级(旧代码白等 2s)
+    t0 = std::chrono::steady_clock::now();
+    auto j2 = tA.explain();
+    const auto d2 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    CHECK(d2 < 500);
+    CHECK(j2.contains("tree_snapshot"));
+
+    CHECK(tA.waitFor(std::chrono::seconds(5)) == TaskState::Succeeded);
+    // 迟到的快照 job 已在共享状态上安全执行(A1 修复的直接验证)
+    auto j3 = tA.explain();
+    CHECK(j3.contains("tree"));
+  }
+
+  // A3:CRC 表并发初始化(现为编译期 constexpr,并发首调无竞态)
+  {
+    std::atomic<int> failed{0};
+    std::vector<std::thread> ths;
+    for (int t = 0; t < 4; ++t) {
+      ths.emplace_back([&, t] {
+        const std::string path =
+            "/tmp/nebulabt_crc_race_" + std::to_string(t) + ".bin";
+        std::remove(path.c_str());
+        JournalFileWriter w;
+        if (!w.open(path, false)) {
+          failed.fetch_add(1);
+          return;
+        }
+        for (int i = 0; i < 50; ++i) {
+          JournalEvent e;
+          e.task_id = "t";
+          e.event = "submitted";
+          e.data = nlohmann::json{{"i", i}};
+          if (!w.append(e)) {
+            failed.fetch_add(1);
+            return;
+          }
+        }
+        nlohmann::json arr;
+        JournalFileReadStats st;
+        if (!readJournalFile(path, arr, &st) || arr.size() != 50 ||
+            st.torn_tail) {
+          failed.fetch_add(1);
+        }
+        std::remove(path.c_str());
+      });
+    }
+    for (auto& th : ths) th.join();
+    CHECK(failed.load() == 0);
+  }
+
+  // B5:调度线程内调用 advanceTime(旧代码两阶段等待自死锁)
+  {
+    class AdvanceInside : public NebulaAction {
+    public:
+      explicit AdvanceInside(Engine* e) : e_(e) {}
+      BT::PortsList providedPorts() const override { return {}; }
+      NodeStatus start(NebulaCtx&, const Done&) override {
+        e_->advanceTime(10);  // 应被拒绝而非死锁
+        return NodeStatus::SUCCESS;
+      }
+
+    private:
+      Engine* e_;
+    };
+    auto vclock = std::make_shared<VirtualClock>();
+    Engine engine(vclock);
+    engine.registerAction("AdvanceInside", std::make_shared<AdvanceInside>(&engine));
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><AdvanceInside/></BehaviorTree></root>)");
+    CHECK(task.waitFor(std::chrono::seconds(2)) == TaskState::Succeeded);
+  }
+
+  // B7:journal 内存上限可配 + 触顶告警一次(sink 不受影响)
+  {
+    Engine engine;
+    engine.registerAction("SideEffect", std::make_shared<SideEffect>());
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    std::atomic<int> warns{0};
+    engine.setLogger([&warns](LogLevel lv, const std::string&) {
+      if (lv == LogLevel::Warn) warns.fetch_add(1);
+    });
+    EngineLimits lim;
+    lim.max_journal_events = 3;
+    engine.setLimits(lim);
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <Checkpoint id="cp"><SideEffect/></Checkpoint>
+          <Ok/>
+        </Sequence>
+      </BehaviorTree></root>)");
+    CHECK(task.wait() == TaskState::Succeeded);
+    // 事件序列 submitted/started/checkpoint/finished:内存截到 3 条
+    CHECK(task.journal().size() == 3);
+    CHECK(warns.load() >= 1);
+  }
+}
+
 // ---- M8:失败码登记表 + LLMDecision ----
 static void test_m8_agent() {
   // 1) 失败码登记表:未登记的码被标记 undeclared_code
@@ -1671,6 +1830,9 @@ int main() {
   std::cout << "ok  m7 observability (failure inputs / runtime explain / groot2)\n";
   test_m8_agent();
   std::cout << "ok  m8 agent (failure code registry / LLM decision guardrails)\n";
+  test_review_fixes();
+  std::cout << "ok  review fixes (explain safety / logf reentry / crc constexpr /\n"
+               "     advance guard / zombie submit / journal cap)\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

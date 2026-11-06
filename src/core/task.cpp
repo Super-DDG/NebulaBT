@@ -106,27 +106,38 @@ nlohmann::json TaskHandle::explain() const {
       j["tree"] = detail::explainTreeNode(ctx_->tree->rootNode(), "",
                                           ctx_->node_stats.get());
     } else if (core_) {
+      // 快照状态必须共享:explain() 超时返回后 job 仍会(迟到)执行,
+      // 栈上引用会悬垂成 UB;job 与等待方经 shared_ptr 安全交接
+      struct SnapState {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        nlohmann::json snap;
+      };
       auto ctx = ctx_;
-      std::mutex m;
-      std::condition_variable cv;
-      bool done = false;
-      nlohmann::json snap;
-      core_->scheduler.post([&ctx, &snap, &done, &cv, &m] {
-        if (ctx->tree && ctx->tree->rootNode()) {
-          snap = detail::explainTreeNode(ctx->tree->rootNode(), "",
-                                         ctx->node_stats.get());
+      auto st = std::make_shared<SnapState>();
+      if (core_->scheduler.post([ctx, st] {
+            if (ctx->tree && ctx->tree->rootNode()) {
+              st->snap = detail::explainTreeNode(ctx->tree->rootNode(), "",
+                                                 ctx->node_stats.get());
+            }
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->done = true;
+            st->cv.notify_all();
+          })) {
+        std::unique_lock<std::mutex> lk(st->mu);
+        // 2s 上限:从调度线程自身调用时 job 无法执行(返回无树快照)
+        st->cv.wait_for(lk, std::chrono::seconds(2),
+                        [&] { return st->done; });
+        if (st->done) {
+          j["tree"] = std::move(st->snap);
+        } else {
+          j["tree_snapshot"] =
+              "unavailable (scheduler busy or called from scheduler thread)";
         }
-        std::lock_guard<std::mutex> lk(m);
-        done = true;
-        cv.notify_all();
-      });
-      std::unique_lock<std::mutex> lk(m);
-      // 2s 上限:从调度线程自身调用会死锁在此超时上(返回无树快照)
-      cv.wait_for(lk, std::chrono::seconds(2), [&] { return done; });
-      if (done) {
-        j["tree"] = std::move(snap);
       } else {
-        j["tree_snapshot"] = "unavailable (called from scheduler thread?)";
+        // 投递被拒(队列满/已停止):立即降级,不再白等 2s
+        j["tree_snapshot"] = "unavailable (scheduler queue full or stopped)";
       }
     }
   }

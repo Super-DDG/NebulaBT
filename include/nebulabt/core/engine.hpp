@@ -35,6 +35,10 @@ struct EngineLimits {
   size_t max_pending_jobs = 0;
   /// 未触发定时器上限;超限投递被拒绝并告警
   size_t max_pending_timers = 0;
+  /// 单任务内存 journal 事件上限(0 = 不限)。触顶:新事件不再入内存
+  /// (sink 落盘不受影响),并告警一次——上限太小会丢检查点事件,
+  /// 恢复时已完成段被重执行,按任务事件量调大
+  size_t max_journal_events = 1000;
 };
 
 class Engine {

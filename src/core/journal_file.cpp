@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -12,23 +13,26 @@ namespace nebulabt {
 
 namespace {
 
-// CRC-32(IEEE 802.3,poly 0xEDB88320),查表实现,无外部依赖
-uint32_t crc32(const uint8_t* data, size_t len) {
-  static uint32_t table[256];
-  static bool init = false;
-  if (!init) {
-    for (uint32_t i = 0; i < 256; ++i) {
-      uint32_t c = i;
-      for (int k = 0; k < 8; ++k) {
-        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-      }
-      table[i] = c;
+// CRC-32(IEEE 802.3,poly 0xEDB88320),查表实现,无外部依赖。
+// 表在编译期生成:写侧(sink 回调)与读侧(恢复线程)可能首次并发
+// 调用,运行期惰性初始化存在数据竞争
+constexpr std::array<uint32_t, 256> makeCrcTable() {
+  std::array<uint32_t, 256> table{};
+  for (uint32_t i = 0; i < 256; ++i) {
+    uint32_t c = i;
+    for (int k = 0; k < 8; ++k) {
+      c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
     }
-    init = true;
+    table[i] = c;
   }
+  return table;
+}
+constexpr auto kCrcTable = makeCrcTable();
+
+uint32_t crc32(const uint8_t* data, size_t len) {
   uint32_t c = 0xFFFFFFFFu;
   for (size_t i = 0; i < len; ++i) {
-    c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+    c = kCrcTable[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
   }
   return c ^ 0xFFFFFFFFu;
 }

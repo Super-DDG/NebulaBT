@@ -39,11 +39,12 @@ struct TaskContext {
   std::atomic<TaskState> state{TaskState::Queued};
   std::atomic<bool> finished{false};
   std::atomic<bool> watchdog_fired{false};  // 本轮静默期已触发过(M4)
+  std::atomic<bool> journal_capped{false};  // journal 触顶已告警(只报一次)
   std::mutex wait_mu;
   std::condition_variable wait_cv;
 
   // journal(M2):任务事件日志 + 已完成检查点的黑板快照
-  static constexpr size_t kJournalMax = 1000;
+  // 内存上限由 EngineLimits.max_journal_events 控制(默认 1000)
   std::mutex journal_mu;
   std::vector<JournalEvent> journal;
   // 仅含从 resume_journal 种子的检查点(上一轮的完成历史)。
