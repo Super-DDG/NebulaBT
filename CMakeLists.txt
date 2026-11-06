@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(NEBULABT_BUILD_EXAMPLES "Build NebulaBT examples" ON)
 option(NEBULABT_BUILD_TESTS "Build NebulaBT tests" ON)
 option(NEBULABT_BUILD_TOOLS "Build the nebula CLI" ON)
+option(NEBULABT_BUILD_BENCH "Build the core performance benchmark" ON)
 
 # 消毒器(测试加固):address | undefined | thread | 组合(逗号分隔)
 #   cmake -S . -B build-asan -DNEBULABT_SANITIZE=address
@@ -101,6 +102,10 @@ endif()
 
 if(NEBULABT_BUILD_TOOLS)
   add_subdirectory(tools)
+endif()
+
+if(NEBULABT_BUILD_BENCH)
+  add_subdirectory(benchmarks)
 endif()
 
 # ---------------------------------------------------------------------------

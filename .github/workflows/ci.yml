@@ -7,8 +7,16 @@ on:
   pull_request:
 
 jobs:
+  # 普通构建 + 全部测试(编译器矩阵)
   build-test:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: ["g++-11", "g++-12"]
+    env:
+      CC: ${{ matrix.compiler }}
+      CXX: ${{ matrix.compiler }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,3 +37,63 @@ jobs:
       # 门禁:示例树必须通过加载期校验(pack 级全量校验由 loadPack 测试覆盖)
       - name: Validate trees (CI gate)
         run: ./build/tools/nebula validate examples/robot_delivery/pack/trees/pick_and_deliver.xml
+
+  # 消毒器(测试加固)。TSan 因 GCC 11/12 对 timed cv 建模不全误报,
+  # 暂不入门禁(见 docs/DESIGN.md 已知限制),升级运行时后补
+  sanitizer:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: ["address", "undefined"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev libtinyxml2-dev cmake
+
+      - name: Configure (${{ matrix.sanitize }})
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+                  -DNEBULABT_SANITIZE=${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest --output-on-failure
+
+  # 覆盖率(库源码;报告上传为 artifact 并写入 job summary)
+  coverage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev libtinyxml2-dev cmake
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+                  -DCMAKE_CXX_FLAGS=--coverage -DCMAKE_EXE_LINKER_FLAGS=--coverage
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest --output-on-failure
+
+      - name: Coverage report
+        run: |
+          cd build/CMakeFiles
+          find . -name "*.cpp.o" | while read o; do
+            gcov -o "$(dirname "$o")" "$o" >/dev/null 2>&1 || true
+          done
+          python3 scripts/coverage.py "$PWD" | tee coverage_report.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: build/CMakeFiles/coverage_report.txt
