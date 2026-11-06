@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nebulabt VERSION 1.0.0 LANGUAGES CXX)
+project(nebulabt VERSION 1.1.0 LANGUAGES CXX)
 
 # 提前开启:examples 子目录也注册 add_test(示例即测试)
 enable_testing()

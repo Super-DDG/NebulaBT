@@ -172,14 +172,16 @@ void EngineCore::finishTask(std::shared_ptr<TaskContext> ctx, TaskState st,
   appendJournal(ctx, "finished",
                 nlohmann::json{{"state", toString(st)}, {"reason", reason}});
 
+  // 终端日志在唤醒 wait() 之前发出:调用方观察到终态时,日志回调已
+  // 执行(与 finished 事件同理;A2 回归测试曾捕获此竞态)
+  logf(LogLevel::Info, "task " + ctx->task_id + " " + toString(st) +
+                           (reason.empty() ? "" : " (" + reason + ")"));
+
   {
     // 与 wait() 的谓词检查建立顺序,防止丢唤醒
     std::lock_guard<std::mutex> lk(ctx->wait_mu);
   }
   ctx->wait_cv.notify_all();
-
-  logf(LogLevel::Info, "task " + ctx->task_id + " " + toString(st) +
-                           (reason.empty() ? "" : " (" + reason + ")"));
 
   Engine::FinishedCallback cb;
   {

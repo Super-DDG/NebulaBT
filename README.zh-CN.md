@@ -59,7 +59,8 @@ cmake --build build -j
 ./build/examples/hello_tree/hello_tree
 ```
 
-C++17,除 BehaviorTree.CPP 外零运行时依赖。
+C++17,除 BehaviorTree.CPP 外零运行时依赖。**平台:Linux / POSIX**
+(journal fsync 与时间处理使用 POSIX 接口,Windows 暂不支持)。
 
 完整使用文档(节点/树/schema/恢复/树包/测试/线程模型/Agent):
 [docs/USAGE.md](docs/USAGE.md)。

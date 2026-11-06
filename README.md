@@ -125,6 +125,8 @@ cmake --build build -j
 ```
 
 C++17, no other runtime dependencies beyond BehaviorTree.CPP.
+**Platforms: Linux / POSIX** (journal fsync and time handling use POSIX
+APIs; Windows is not supported).
 
 ## Tree packs: trees are versioned assets
 

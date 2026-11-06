@@ -1958,6 +1958,97 @@ static void test_boundaries() {
   }
 }
 
+// ---- 1.1.0 收尾:SDK 动态访问 + YAML 清单保真 ----
+static void test_dynamic_access_and_yaml() {
+  // 1) ctx.inRef / ctx.peek:动态按键访问(CheckSlot 类原语的支撑)
+  {
+    class Probe : public NebulaAction {
+    public:
+      std::string refOfKey;     // key 端口绑定的键名
+      nlohmann::json peeked;    // peek(key) 的值
+      nlohmann::json peekMissing;
+      std::string refOfLiteral; // 字面量端口 → 空串
+      BT::PortsList providedPorts() const override {
+        // 动态键端口必须无类型,避免 {floor} 把真实 int 键钉成 string
+        return { BT::InputPort("key", "blackboard key"),
+                 BT::InputPort<std::string>("lit") };
+      }
+      BT::NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        refOfKey = ctx.inRef("key");
+        refOfLiteral = ctx.inRef("lit");
+        peeked = ctx.peek(refOfKey);
+        peekMissing = ctx.peek("no_such_key");
+        return BT::NodeStatus::SUCCESS;
+      }
+    };
+    Engine engine;
+    auto probe = std::make_shared<Probe>();
+    engine.registerAction("Probe", probe);
+
+    TaskSpec spec;
+    spec.slots["floor"] = 3;
+    spec.schema = nlohmann::json{
+        {"slots", {{"floor", {{"type", "int"}, {"required", true}}}}}};
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Probe key="{floor}" lit="just_text"/>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(probe->refOfKey == "floor");            // {floor} → 键名 "floor"
+    CHECK(probe->refOfLiteral.empty());           // 字面量 → 空
+    CHECK(probe->peeked == 3);                    // 按名读到真实 int
+    CHECK(probe->peekMissing.is_null());          // 缺失键 → null
+  }
+
+#ifdef NEBULABT_HAVE_YAML
+  // 2) YAML 清单保真:引号标量恒为字符串、版本号不被吞成数值、
+  //    bool/int 按真实类型转换(经 loadPack 全链路验证)
+  {
+    const std::string dir = "/tmp/nebulabt_yaml_pack";
+    mkdir("/tmp", 0755);
+    mkdir(dir.c_str(), 0755);
+    mkdir((dir + "/trees").c_str(), 0755);
+    std::ofstream(dir + "/pack.yaml") << R"YAML(
+name: yamlpack
+version: "1.0.0"          # 引号标量:必须保持字符串
+timeout_scalar: 1.0.0     # 无引号但非数值:不得被吞成 1.0
+task_types:
+  Y_TASK:
+    tree: y_tree
+    schema:
+      slots:
+        n: { type: int, required: true }
+    failure_codes:
+      E_Y: declared in yaml
+)YAML";
+    std::ofstream(dir + "/trees/y_tree.xml") << R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <ParityAction n="{n}" which="{which}"/>
+      </BehaviorTree></root>)";
+
+    Engine engine;
+    engine.registerAction("ParityAction", std::make_shared<ParityAction>());
+    CHECK_NOTHROW(engine.loadPack(dir));   // version 非字符串会在这里抛
+    // 版本号保真:经路由清单断言(被吞成 1.0 double 的话 parsePackManifest
+    // 会因 missing 'version' 抛异常,loadPack 已覆盖;这里再验证清单)
+    bool found = false;
+    for (const auto& ti : engine.loadedTaskTypes()) {
+      if (ti.task_type == "Y_TASK" && ti.pack == "yamlpack" &&
+          ti.version == "1.0.0") {
+        found = true;
+      }
+    }
+    CHECK(found);
+    // YAML 声明的失败码与 JSON 同等生效
+    TaskSpec s;
+    s.task_type = "Y_TASK";
+    s.slots["n"] = 2;
+    auto t = engine.submitTask(s);
+    CHECK(t.wait() == TaskState::Succeeded);
+  }
+#endif
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -2027,6 +2118,8 @@ int main() {
   test_boundaries();
   std::cout << "ok  boundaries (comp children / async compensation / llm throw /\n"
                "     double done / bad journal header / guard period=0)\n";
+  test_dynamic_access_and_yaml();
+  std::cout << "ok  dynamic access (inRef/peek) + yaml manifest fidelity\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

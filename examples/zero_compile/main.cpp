@@ -107,7 +107,9 @@ public:
 class CheckSlot : public NebulaAction {
 public:
   BT::PortsList providedPorts() const override {
-    return { BT::InputPort<std::string>("key"),
+    // key 声明为无类型端口:{键} 绑定不把黑板键钉成 string(与
+    // ReactiveGuard 同法),否则 bool/int 槽位会与声明冲突
+    return { BT::InputPort("key", "要检查的黑板键,如 {parcel_ready}"),
              BT::InputPort<std::string>("op"),
              BT::InputPort<std::string>("value") };
   }

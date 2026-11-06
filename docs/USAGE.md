@@ -1,6 +1,7 @@
 # NebulaBT 使用文档
 
-> 适用版本:v1.0.0 · 面向读者:使用 NebulaBT 组织业务逻辑的工程师
+> 适用版本:v1.1.0 · 面向读者:使用 NebulaBT 组织业务逻辑的工程师
+> 平台:Linux / POSIX(journal fsync 与时间 API 使用 POSIX 接口,Windows 暂不支持)
 > 设计动机与架构见 [DESIGN.md](DESIGN.md);关键决策见 [docs/adr/](adr/)。
 
 ---
@@ -49,9 +50,10 @@
 
 ### 依赖
 
-- C++17 编译器(GCC ≥ 9 / Clang ≥ 8 / MSVC 2019+)
+- C++17 编译器(GCC ≥ 9 / Clang ≥ 8;**仅 Linux/POSIX**,Windows 暂不支持)
 - CMake ≥ 3.16
 - BehaviorTree.CPP 4.9(自动 FetchContent,或系统已装则直接使用)
+- (可选)yaml-cpp 0.7+,启用 `NEBULABT_WITH_YAML` 时需要
 
 ### 集成到你的项目
 
@@ -61,7 +63,7 @@
 include(FetchContent)
 FetchContent_Declare(nebulabt
   GIT_REPOSITORY https://github.com/Super-DDG/NebulaBT.git
-  GIT_TAG v1.0.0)
+  GIT_TAG v1.1.0)
 FetchContent_MakeAvailable(nebulabt)
 
 target_link_libraries(your_app PRIVATE nebulabt::nebulabt)
@@ -75,7 +77,7 @@ cmake --install build --prefix /opt/nebulabt
 ```
 
 ```cmake
-find_package(nebulabt 1.0 REQUIRED)   # -DCMAKE_PREFIX_PATH=/opt/nebulabt
+find_package(nebulabt 1.1 REQUIRED)   # -DCMAKE_PREFIX_PATH=/opt/nebulabt
 target_link_libraries(your_app PRIVATE nebulabt::nebulabt)
 ```
 
