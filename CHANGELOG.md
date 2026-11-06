@@ -3,6 +3,31 @@
 All notable changes to NebulaBT are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased] - 零编译宿主与可选 YAML 清单
+
+### Added
+
+- **pack 清单双格式**:`pack.json` 保持规范格式(零依赖不变);
+  `-DNEBULABT_WITH_YAML=ON`(需 yaml-cpp)后 `<pack>/pack.yaml` 完全等价
+  ——注释即文档,ROS 生态友好。引号标量恒为字符串、数字判定整串精确
+  匹配(版本号 "1.0.0" 不被吞成数值)。
+- **0 编译新增任务 demo**(`examples/zero_compile`):宿主只编译一次,
+  内置通用原语(Log 支持 `{key}` 文案插值 / Wait / SetSlot / CheckSlot /
+  Fail)+ REPL(`list` / 提交 JSON / `load <dir>` 运行时加载新包)。
+  新增任务类型 = 丢一个 pack 目录进 packs/,运行时 load 即时生效。
+  CTest `zero_compile` 常驻:运行中加载新包 → 新任务端到端跑通
+  (含失败路径的重试 + 自动补偿)。CI 增 `yaml-manifest` job。
+- **SDK 能力**:`ctx.inRef(port)`(端口绑定的黑板键名)与
+  `ctx.peek(key)`(按名读黑板键)——支撑 CheckSlot 类"动态按键访问"
+  的条件原语;常规数据流仍应走端口。
+- **Engine::loadedTaskTypes()**:已加载任务类型清单(编排宿主展示/路由)。
+
+### Fixed
+
+- loadPack 中 pack 失败码登记发生在 `std::move(manifest)` 之后——
+  moved-from 对象为空,pack 声明的失败码实际从未注册(M8 引入)。
+  登记提前到 move 之前,并补回归断言。
+
 ## [Unreleased] - 测试加固(sanitizer / 覆盖率 / CLI / 并发)
 
 ### Fixed

@@ -23,6 +23,7 @@
 14. [错误码约定](#14-错误码约定)
 15. [最佳实践与反模式](#15-最佳实践与反模式)
 16. [Agent 骨架:LLM 提议,守护裁决](#16-agent-骨架llm-提议守护裁决)
+17. [0 编译新增任务:通用宿主](#17-0-编译新增任务通用宿主)
 
 ---
 
@@ -559,9 +560,28 @@ auto t2 = engine.submitTask(spec);
 
 ```
 mypack/
-├── pack.json
+├── pack.json          # 规范格式(零依赖)
 └── trees/*.xml
 ```
+
+**YAML 清单(可选)**:`-DNEBULABT_WITH_YAML=ON`(需 yaml-cpp)后,
+`pack.yaml` 与 pack.json 完全等价、字段一致——注释即文档,ROS 生态友好:
+
+```yaml
+# mypack/pack.yaml —— 注释随配置走,新增任务加一条即可
+name: delivery
+version: "1.0.0"
+task_types:
+  DELIVER_ORDER:
+    tree: deliver_order
+    schema:
+      slots:
+        target: { type: string, required: true }
+    failure_codes:
+      LOCKER_BUSY: 目标柜格被占用
+```
+
+引用规范(pack.json 优先;二者并存时 JSON 胜出)。
 
 ```json
 {
@@ -786,6 +806,36 @@ engine.registerAction("LLMDecision", std::make_shared<LlmDecision>(client));
   决策 + 违规的完整证据链(LLM 决策不可复现,轨迹是唯一审计依据)
 - **生成护栏**:`nebula validate --json` 输出机器可读错误——
   LLM 生成树草稿 → 校验 → 错误回灌修复 → 人审入库
+
+---
+
+## 17. 0 编译新增任务:通用宿主(参考 examples/zero_compile)
+
+任务类型 = **通用原语动作的组合 + pack 资产**。宿主只编译一次,新增任务
+不改代码、不重编译:
+
+```bash
+./build/examples/zero_compile/task_host examples/zero_compile/packs
+# REPL:
+#   list                        列出已加载的任务类型
+#   {"task_type": "PATROL_AREA", "slots": {...}}   提交任务
+#   load <dir>                  运行时加载新树包(丢进 packs/ 即生效)
+```
+
+宿主内置的通用原语:`Log`(支持 `{key}` 文案插值)/ `Wait` / `SetSlot` /
+`CheckSlot`(eq/ne/gt/lt/contains)/ `Fail` + 全部内置节点(Checkpoint/
+Compensable/ReactiveGuard/RetryWithDelay/ForEach/WhileLoop/SwitchN)。
+
+配套 SDK 能力:`ctx.inRef(port)` 取端口绑定的键名、`ctx.peek(key)` 按名
+读黑板——支撑"按键名检查任意槽位"的条件原语。
+
+要点(来自 [examples/zero_compile](../examples/zero_compile)):
+- 新任务 = `packs/` 下一个目录(pack.json 或 pack.yaml)+ 一棵树,
+  `load` 即时生效,加载期校验照常把关
+- 通用原语是你的**能力面**:需要新能力(如 HTTP 调用、话题发布)时
+  才写一次 C++,之后所有任务复用
+- demo 的 CTest(`zero_compile`)在 CI 常驻:运行中 `load` 新包 →
+  新任务类型端到端跑通(含失败路径的重试 + 自动补偿)
 
 ---
 

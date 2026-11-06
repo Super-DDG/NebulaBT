@@ -62,6 +62,14 @@ public:
   /// 字面量保持 string。用途:mock 调用录制、业务日志、调试。
   nlohmann::json inputsJson() const { return inputs_; }
 
+  /// 端口绑定的黑板键名:port="slot_name" 形式;字面量绑定返回空串。
+  /// 供"按名字检查任意黑板键"的条件类节点使用(如 CheckSlot)
+  std::string inRef(const std::string& port) const;
+
+  /// 按名字读黑板键(Any 类型分发;键缺失返回 null)。
+  /// 与 inRef 组合支持动态键访问;常规数据流仍应走端口
+  nlohmann::json peek(const std::string& blackboardKey) const;
+
   const std::string& taskId() const { return task_id_; }
   const std::string& taskType() const { return task_type_; }
 

@@ -2,6 +2,7 @@
 
 #include "bridge_node.hpp"
 #include "engine_core.hpp"
+#include "manifest_io.hpp"
 #include "node_stats.hpp"
 #include "tree_check.hpp"
 #include "nebulabt/core/schema.hpp"
@@ -171,18 +172,26 @@ TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec,
   return submitTree(std::move(tree), std::move(spec), packName, packVersion);
 }
 
-void Engine::loadPack(const std::string& manifestDir) {
-  const std::string manifestPath = manifestDir + "/pack.json";
-  std::ifstream f(manifestPath);
-  if (!f) {
-    throw std::runtime_error("loadPack: cannot read " + manifestPath);
+std::vector<Engine::TaskTypeInfo> Engine::loadedTaskTypes() const {
+  std::vector<TaskTypeInfo> out;
+  std::lock_guard<std::mutex> lk(core_->mu);
+  for (const auto& p : core_->packs) {
+    for (const auto& [taskType, task] : p.manifest.tasks) {
+      out.push_back(TaskTypeInfo{taskType, p.manifest.name, p.manifest.version});
+    }
   }
+  return out;
+}
+
+void Engine::loadPack(const std::string& manifestDir) {
+  // pack.json(规范)或 pack.yaml(可选,YAML 支持编译启用时)
   nlohmann::json j;
-  try {
-    f >> j;
-  } catch (const std::exception& e) {
-    throw std::runtime_error("loadPack: manifest parse: " +
-                             std::string(e.what()));
+  std::string manifestFormat;
+  {
+    std::string err;
+    if (!detail::readManifestFile(manifestDir, &j, &manifestFormat, &err)) {
+      throw std::runtime_error("loadPack: " + err);
+    }
   }
   auto manifest = parsePackManifest(j);
 
@@ -245,18 +254,22 @@ void Engine::loadPack(const std::string& manifestDir) {
     }
   }
 
-  {
-    std::lock_guard<std::mutex> lk(core_->mu);
-    core_->packs.push_back(detail::EngineCore::PackEntry{
-        std::move(manifest), manifestDir});
-  }
+  // 先取出 move 后仍需要的字段(push_back 会 move 掉 manifest)
+  const std::string packName = manifest.name;
+  const std::string packVersion = manifest.version;
   // M8:pack 声明的失败码登记进引擎(先声明后使用)
   for (const auto& [taskType, task] : manifest.tasks) {
     for (const auto& [code, desc] : task.failure_codes) {
       core_->failure_codes->declare(code, desc);
     }
   }
-  core_->logf(LogLevel::Info, "pack loaded (see journal for details)");
+  {
+    std::lock_guard<std::mutex> lk(core_->mu);
+    core_->packs.push_back(detail::EngineCore::PackEntry{
+        std::move(manifest), manifestDir});
+  }
+  core_->logf(LogLevel::Info, "pack '" + packName + "' v" + packVersion +
+                                 " loaded (" + manifestFormat + ")");
 }
 
 TaskHandle Engine::submitTask(TaskSpec spec) {

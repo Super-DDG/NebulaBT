@@ -1,0 +1,19 @@
+{
+  "name": "patrol_json",
+  "version": "1.0.0",
+  "task_types": {
+    "PATROL_AREA": {
+      "tree": "patrol_area",
+      "schema": {
+        "slots": {
+          "zone":       { "type": "string",       "required": true },
+          "waypoints":  { "type": "string_array", "required": true }
+        }
+      },
+      "timeout_ms": 30000,
+      "failure_codes": {
+        "CHECK_FAILED": "condition on blackboard slot did not hold"
+      }
+    }
+  }
+}

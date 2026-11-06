@@ -1,0 +1,19 @@
+{
+  "name": "delivery_extra",
+  "version": "1.0.0",
+  "task_types": {
+    "DELIVER_PARCEL": {
+      "tree": "deliver_parcel",
+      "schema": {
+        "slots": {
+          "parcel":      { "type": "string", "required": true },
+          "destination": { "type": "string", "required": false }
+        }
+      },
+      "timeout_ms": 30000,
+      "failure_codes": {
+        "PICKUP_BUSY": "parcel locker is occupied"
+      }
+    }
+  }
+}

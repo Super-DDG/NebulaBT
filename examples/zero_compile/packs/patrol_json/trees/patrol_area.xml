@@ -1,0 +1,17 @@
+<root BTCPP_format="v4" main_tree_to_execute="patrol_area">
+  <BehaviorTree ID="patrol_area">
+    <Sequence name="patrol">
+      <Log message="patrol starting in {zone}"/>
+      <ForEach array="{waypoints}" element="{wp}">
+        <Sequence>
+          <Log message="navigating to {wp}"/>
+          <Wait delay_ms="20"/>
+          <Checkpoint id="waypoint_done">
+            <Log message="arrived at {wp}"/>
+          </Checkpoint>
+        </Sequence>
+      </ForEach>
+      <Log message="patrol complete"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

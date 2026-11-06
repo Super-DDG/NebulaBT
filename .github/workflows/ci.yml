@@ -64,6 +64,26 @@ jobs:
       - name: Test
         run: cd build && ctest --output-on-failure
 
+  # 可选 YAML 清单支持(零依赖不受影响;验证 pack.yaml 加载路径)
+  yaml-manifest:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev libtinyxml2-dev cmake libyaml-cpp-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNEBULABT_WITH_YAML=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest --output-on-failure
+
   # 覆盖率(库源码;报告上传为 artifact 并写入 job summary)
   coverage:
     runs-on: ubuntu-22.04

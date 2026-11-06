@@ -70,7 +70,17 @@ public:
   /// 加载树包(目录须含 pack.json)。加载即全量校验:每棵树可解析、
   /// schema 数据流检查通过,失败抛异常——CI 中加载全部 pack 即门禁。
   /// 注意:先 registerAction 再 loadPack(树中的节点必须已注册)。
+  /// manifestDir 指向含 pack.json(或 pack.yaml,YAML 支持编译启用时)
+  /// 的目录;加载即校验全部树,失败抛异常(CI 门禁)。
   void loadPack(const std::string& manifestDir);
+
+  /// 已加载 pack 提供的任务类型清单(编排宿主展示/路由用)
+  struct TaskTypeInfo {
+    std::string task_type;
+    std::string pack;
+    std::string version;
+  };
+  std::vector<TaskTypeInfo> loadedTaskTypes() const;
 
   /// 按 task_type 从已加载树包解析树文件并提交(spec.schema/timeout_ms
   /// 未显式给出时,采用 pack 声明的默认值)

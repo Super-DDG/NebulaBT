@@ -730,7 +730,8 @@ static void writePack(const std::string& dir, const std::string& name,
       << "{\"name\":\"" << name << "\",\"version\":\"" << version
       << "\",\"task_types\":{\"M3_TASK\":{"
       << "\"tree\":\"m3_tree\","
-      << "\"schema\":{\"slots\":{\"n\":{\"type\":\"int\",\"required\":true}}}}}}";
+      << "\"schema\":{\"slots\":{\"n\":{\"type\":\"int\",\"required\":true}}},"
+      << "\"failure_codes\":{\"E_DECLARED\":\"declared in pack manifest\"}}}}";
   std::ofstream(treesDir + "/m3_tree.xml") << treeBody;
 }
 
@@ -791,6 +792,57 @@ static void test_pack_and_canary() {
   spec3.slots["n"] = 4;
   spec3.pack_version = "1.0.0";
   CHECK(engine.submitTask(spec3).explain()["pack_version"] == "1.0.0");
+
+  // M8 回归:pack 清单声明的失败码必须在 move 前登记(moved-from 为空的
+  // 旧实现使 failure_codes 从未注册)。声明码 → undeclared_code=false,
+  // 未声明码 → true
+  {
+    writePack(base + "/fpack", "fpack", "1.0.0", R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Fallback>
+          <FailAlways/>
+          <FailUndeclared/>
+        </Fallback>
+      </BehaviorTree></root>)");
+
+    class CodedFail : public NebulaAction {
+    public:
+      explicit CodedFail(std::string code) : code_(std::move(code)) {}
+      BT::PortsList providedPorts() const override { return {}; }
+      BT::NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        ctx.fail(code_, "by design");
+        return BT::NodeStatus::FAILURE;
+      }
+
+    private:
+      std::string code_;
+    };
+
+    Engine engine2;
+    engine2.registerAction("FailAlways", std::make_shared<CodedFail>("E_DECLARED"));
+    engine2.registerAction("FailUndeclared", std::make_shared<CodedFail>("E_OTHER"));
+    CHECK_NOTHROW(engine2.loadPack(base + "/fpack"));
+
+    TaskSpec s;
+    s.task_type = "M3_TASK";
+    s.slots["n"] = 2;
+    auto t = engine2.submitTask(s);
+    CHECK(t.wait() == TaskState::Failed);
+    const auto failures = t.failures();
+    CHECK(failures.size() == 2);
+    CHECK(failures[0].code == "E_DECLARED");
+    CHECK(failures[0].undeclared_code == false);  // pack 声明的码已登记
+    CHECK(failures[1].code == "E_OTHER");
+    CHECK(failures[1].undeclared_code == true);   // 未登记码被标记
+    // loadedTaskTypes:move 后清单仍正确
+    bool found = false;
+    for (const auto& ti : engine2.loadedTaskTypes()) {
+      if (ti.task_type == "M3_TASK" && ti.pack == "fpack") {
+        found = true;
+      }
+    }
+    CHECK(found);
+  }
 
   // 重复加载同版本 -> 抛异常
   bool threw = false;

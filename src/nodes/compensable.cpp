@@ -20,13 +20,13 @@ BT::NodeStatus CompensableNode::tick() {
         "Compensable must have exactly 2 children (main work + compensation)");
   }
   if (status() == BT::NodeStatus::IDLE) {
-    saga_id_ = getInput<std::string>("id").value_or("");
+    (void)getInput<std::string>("id", saga_id_);
     if (saga_id_.empty()) {
       throw BT::RuntimeError("Compensable: 'id' port is required");
     }
     task_id_ = "unknown";
     if (auto bb = config().blackboard) {
-      bb->get("task_id", task_id_);
+      (void)bb->get("task_id", task_id_);
     }
   }
 

@@ -174,6 +174,7 @@ nebula doc      <tree.xml>                 # tree -> mermaid flowchart
 | [robot_delivery](examples/robot_delivery) | robotics | data-driven search (N copies → 1), checkpoints, kill-resume, tree pack + schema |
 | [game_npc](examples/game_npc) | games | ReactiveFallback priority brain, WhileLoop patrol — and scenario E: LLM-driven decisions where a ReactiveGuard **vetoes the LLM mid-engage** when the player flees |
 | [order_fulfillment](examples/order_fulfillment) | backend | payment fallback chains, retry wall-clock budget, Saga compensation via `Compensable`, schema-validated orders |
+| [zero_compile](examples/zero_compile) | ops/orchestration | a resident host with generic primitives (Log/Wait/SetSlot/CheckSlot) — **new task types at runtime by dropping a pack directory, zero recompilation** |
 
 Every example asserts its outcomes and runs as a CTest case — they are living
 documentation, not screenshots.

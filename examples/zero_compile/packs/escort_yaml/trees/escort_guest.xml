@@ -1,0 +1,21 @@
+<root BTCPP_format="v4" main_tree_to_execute="escort_guest">
+  <BehaviorTree ID="escort_guest">
+    <Sequence name="escort">
+      <Log message="escorting guest {guest_name}"/>
+      <Compensable id="hold_elevator">
+        <Sequence>
+          <Log message="elevator held"/>
+          <Wait delay_ms="20"/>
+        </Sequence>
+        <Log message="elevator released (compensation)"/>
+      </Compensable>
+      <ReactiveGuard while_true="{guest_present}" period_ms="30">
+        <Sequence>
+          <Wait delay_ms="60"/>
+          <Log message="guest accompanied"/>
+        </Sequence>
+      </ReactiveGuard>
+      <Log message="escort complete"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

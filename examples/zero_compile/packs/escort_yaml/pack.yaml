@@ -1,0 +1,17 @@
+# 押送任务包(YAML 格式演示;字段结构与 pack.json 完全一致)
+#
+# 任务类型 ESCORT_GUEST:
+#   - Compensable:占电梯是副作用,声明"释放电梯"补偿——押送失败自动逆序执行
+#   - ReactiveGuard:陪同段持续要求 guest_present;客人离开即打断
+#
+# 新增任务类型:本文件加一条 + trees/ 加一棵树,无需改 C++ 代码。
+name: escort_yaml
+version: "1.0.0"
+task_types:
+  ESCORT_GUEST:
+    tree: escort_guest
+    schema:
+      slots:
+        guest_name:    { type: string, required: true }
+        guest_present: { type: bool,   required: true }
+    timeout_ms: 30000

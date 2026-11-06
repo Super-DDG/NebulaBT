@@ -12,6 +12,9 @@ option(NEBULABT_BUILD_EXAMPLES "Build NebulaBT examples" ON)
 option(NEBULABT_BUILD_TESTS "Build NebulaBT tests" ON)
 option(NEBULABT_BUILD_TOOLS "Build the nebula CLI" ON)
 option(NEBULABT_BUILD_BENCH "Build the core performance benchmark" ON)
+# 树包清单可选 YAML 支持(规范格式为 pack.json,零依赖不变;
+# 开启后 <pack>/pack.yaml 亦可,需系统安装 yaml-cpp)
+option(NEBULABT_WITH_YAML "Support pack.yaml manifests via yaml-cpp" OFF)
 
 # 消毒器(测试加固):address | undefined | thread | 组合(逗号分隔)
 #   cmake -S . -B build-asan -DNEBULABT_SANITIZE=address
@@ -70,6 +73,7 @@ add_library(nebulabt
   src/core/engine_core.cpp
   src/core/bridge_node.cpp
   src/core/node_stats.cpp
+  src/core/manifest_io.cpp
   src/core/nebula_ctx.cpp
   src/core/task.cpp
   src/core/tree_check.cpp
@@ -90,11 +94,18 @@ target_include_directories(nebulabt PUBLIC
 target_compile_features(nebulabt PUBLIC cxx_std_17)
 target_link_libraries(nebulabt PUBLIC ${NEBULABT_BT_CPP_TARGET})
 
+if(NEBULABT_WITH_YAML)
+  find_package(yaml-cpp REQUIRED)
+  target_link_libraries(nebulabt PUBLIC yaml-cpp)
+  target_compile_definitions(nebulabt PUBLIC NEBULABT_HAVE_YAML)
+endif()
+
 if(NEBULABT_BUILD_EXAMPLES)
   add_subdirectory(examples/hello_tree)
   add_subdirectory(examples/robot_delivery)
   add_subdirectory(examples/game_npc)
   add_subdirectory(examples/order_fulfillment)
+  add_subdirectory(examples/zero_compile)
 endif()
 
 if(NEBULABT_BUILD_TESTS)
