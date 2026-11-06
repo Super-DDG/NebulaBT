@@ -47,7 +47,8 @@ if(NOT behaviortree_cpp_FOUND)
   else()
     FetchContent_Declare(behaviortree_cpp
       GIT_REPOSITORY https://github.com/BehaviorTree/BehaviorTree.CPP.git
-      GIT_TAG v4.9.0)
+      # 注意:BT.CPP 的 tag 不带 v 前缀(tag 4.9.0,不是 v4.9.0)
+      GIT_TAG 4.9.0)
   endif()
   FetchContent_MakeAvailable(behaviortree_cpp)
 endif()
