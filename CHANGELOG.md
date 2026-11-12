@@ -7,12 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ### Fixed
 
-- **FetchContent 构建链接失败**(CI 抓获,本地系统包掩盖):BT.CPP 的
-  Groot2Publisher 符号受 BTCPP_GROOT_INTERFACE 编译期裁剪,而本库 CMake
-  原来在 FetchContent 路径强制关闭它、代码却无条件引用。现以
-  `NEBULABT_WITH_GROOT2`(默认 ON,需 ZeroMQ;CI 已装)驱动该开关,
-  关闭时代码以 `NEBULABT_NO_GROOT2` 守护,`groot2_port` 仅告警。
-  同批:FetchContent tag 修正(4.9.0,无 v 前缀)。
+- **失败记录在 gcc-12 下全部静默丢失**(CI 抓获,实参求值顺序未指定的
+  UB):BridgeNode::initCtx 把 `findFailures(taskId)` 与
+  `std::move(taskId)` 放在同一构造调用——两者求值顺序未指定,gcc-12 下
+  move 先行,findFailures 收到空串,failures_ 为 null,所有 ctx.fail
+  静默丢弃(执行不受影响,可观测性归零)。改为先取出再 move。
+  同批:FetchContent 构建链接失败(BTCPP_GROOT_INTERFACE 裁剪,
+  `NEBULABT_WITH_GROOT2` 选项化)、FetchContent tag 修正(4.9.0,
+  无 v 前缀)、initCtx 读不到 task_id 时告警而非静默降级。
 
 ## [1.1.0] - 2026-11-06
 

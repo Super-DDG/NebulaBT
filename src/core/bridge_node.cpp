@@ -186,7 +186,12 @@ void BridgeNode::initCtx() {
   task_id_ = taskId;
   // 直接 new(NebulaCtx 构造私有,friend 本类;make_unique 的实例化
   // 上下文不继承 friend 权限,不能用于私有构造)
-  ctx_.reset(new NebulaCtx(*this, core_->findFailures(taskId),
+  // 注意:findFailures(taskId) 依赖 taskId 的值,而同一调用里的
+  // std::move(taskId) 与它**求值顺序未指定**——gcc-12 下 move 先行,
+  // findFailures 收到空串,failures_ 为 null,ctx.fail 全部静默丢失
+  // (CI gcc-12 Release 抓获,DIAG failures.size=0 实证)。先取出再 move。
+  auto failures = core_->findFailures(taskId);
+  ctx_.reset(new NebulaCtx(*this, std::move(failures),
                            std::move(taskId), std::move(taskType),
                            core_->failure_codes));
   ctx_->inputs_ = std::move(inputs);

@@ -165,7 +165,12 @@ int main() {
             break;
           }
         }
-        succeeded = task.waitFor(std::chrono::milliseconds(0)) ==
+        // 结算前给调度线程一个有界排空窗口:advanceTime 已把到期定时器
+        // 物化为作业,落地只需真实毫秒级时间。此前的 waitFor(0) 是与
+        // 调度线程的竞速,偶发把"差最后一次 tick 就完成"误判为崩溃,
+        // 轮次被无谓消耗直至耗尽(CI gcc-12 偶发 CHECK(succeeded) 失败)。
+        // 仍在等待未触发虚拟定时器的任务这里不会完成,照常按崩溃恢复。
+        succeeded = task.waitFor(std::chrono::milliseconds(200)) ==
                     TaskState::Succeeded;
       }  // 引擎析构:任务未终态则取消 = 模拟崩溃
 
@@ -187,6 +192,11 @@ int main() {
       }
     }
 
+    if (!succeeded) {
+      // 8 轮耗尽仍未成功:诊断现场(轮次内 ledger 增量与检查点完成度)
+      std::cerr << "DIAG round " << round << " exhausted: aRun=" << ledger.a
+                << " bRun=" << ledger.b << "\n";
+    }
     CHECK(succeeded);  // 有限轮内必然恢复成功
   }
 
