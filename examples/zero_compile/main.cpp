@@ -180,7 +180,8 @@ static void submitAndReport(Engine& engine, const nlohmann::json& req) {
     return;
   }
   const TaskState st = task.wait();
-  std::cout << "[task] " << spec.task_type << " -> " << toString(st) << "\n";
+  std::cout << "[task] " << spec.task_type << " -> " << toString(st)
+            << " (failures: " << task.failures().size() << ")\n";
   for (const auto& f : task.failures()) {
     std::cout << "    [fail] " << f.code << ": " << f.message << "\n";
   }

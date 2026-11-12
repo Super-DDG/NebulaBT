@@ -158,8 +158,15 @@ void BridgeNode::initCtx() {
   std::string taskType;
   nlohmann::json inputs = nlohmann::json::object();
   if (auto bb = config().blackboard) {
-    (void)bb->get("task_id", taskId);  // 失败保持默认值
+    const bool idOk = bb->get("task_id", taskId);
     (void)bb->get("task_type", taskType);
+    if (!idOk && core_) {
+      // 失败记录经 findFailures(taskId) 路由:task_id 读不到 = 本任务
+      // 的结构化失败全部静默丢失,必须可见而非默默降级
+      core_->logf(LogLevel::Warn,
+                  "BridgeNode '" + name() + "': task_id not readable from "
+                  "blackboard (failure recording disabled for this task)");
+    }
   }
   // 输入端口快照(激活时刻):{key} 引用解析黑板值,字面量保持 string
   for (const auto& [port, remap] : config().input_ports) {

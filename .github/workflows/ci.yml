@@ -35,9 +35,9 @@ jobs:
       - name: Test
         run: cd build && ctest --output-on-failure
 
-      # 门禁:示例树必须通过加载期校验(pack 级全量校验由 loadPack 测试覆盖)
-      - name: Validate trees (CI gate)
-        run: ./build/tools/nebula validate examples/robot_delivery/pack/trees/pick_and_deliver.xml
+      # 说明:不在此处用 nebula validate 校验示例树——树引用业务动作,
+      # 裸 CLI(未注册动作)必然报 Node not recognized。等价门禁已由
+      # robot_delivery 示例的 loadPack 测试覆盖(加载即校验全部树)。
 
   # 消毒器(测试加固)。TSan 因 GCC 11/12 对 timed cv 建模不全误报,
   # 暂不入门禁(见 docs/DESIGN.md 已知限制),升级运行时后补

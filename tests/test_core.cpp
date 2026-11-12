@@ -129,6 +129,12 @@ static void test_sync_flow_and_explain() {
 
   // 结构化失败:code / node / message 齐全
   auto failures = boom.failures();
+  if (failures.size() != 1) {
+    // CI gcc-12 曾出现记录缺失;打印现场帮助定位(记录路径 or 整体为空)
+    std::cerr << "DIAG failures.size=" << failures.size()
+              << " state=" << toString(boom.state()) << " json="
+              << nlohmann::json(failures).dump() << "\n";
+  }
   CHECK(failures.size() == 1);
   CHECK(failures[0].code == "E_TEST");
   CHECK(failures[0].message == "boom on purpose");
