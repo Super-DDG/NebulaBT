@@ -3,6 +3,17 @@
 All notable changes to NebulaBT are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **FetchContent 构建链接失败**(CI 抓获,本地系统包掩盖):BT.CPP 的
+  Groot2Publisher 符号受 BTCPP_GROOT_INTERFACE 编译期裁剪,而本库 CMake
+  原来在 FetchContent 路径强制关闭它、代码却无条件引用。现以
+  `NEBULABT_WITH_GROOT2`(默认 ON,需 ZeroMQ;CI 已装)驱动该开关,
+  关闭时代码以 `NEBULABT_NO_GROOT2` 守护,`groot2_port` 仅告警。
+  同批:FetchContent tag 修正(4.9.0,无 v 前缀)。
+
 ## [1.1.0] - 2026-11-06
 
 M4–M8 五个里程碑 + 三轮质量收尾。核心叙事:**崩溃安全 → 保护自动包裹 →

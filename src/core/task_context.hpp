@@ -18,7 +18,9 @@
 namespace BT {
 class Tree;
 class StatusChangeLogger;
+#ifndef NEBULABT_NO_GROOT2
 class Groot2Publisher;
+#endif
 }
 
 namespace nebulabt {
@@ -34,7 +36,9 @@ struct TaskContext {
   std::shared_ptr<ActivityStamp> activity =
       std::make_shared<ActivityStamp>(0);  // 最近节点迁移时刻(watchdog)
   std::shared_ptr<BT::StatusChangeLogger> trace;  // 声明在 tree 之后:先于树析构
+#ifndef NEBULABT_NO_GROOT2
   std::shared_ptr<BT::Groot2Publisher> groot2;    // M7:实时可视化(可选)
+#endif
   std::shared_ptr<FailureLog> failures = std::make_shared<FailureLog>();
   std::atomic<TaskState> state{TaskState::Queued};
   std::atomic<bool> finished{false};

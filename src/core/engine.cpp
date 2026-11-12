@@ -16,7 +16,9 @@
 
 #include <behaviortree_cpp/blackboard.h>
 #include <behaviortree_cpp/behavior_tree.h>
+#ifndef NEBULABT_NO_GROOT2
 #include <behaviortree_cpp/loggers/groot2_publisher.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -406,7 +408,10 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
       static_cast<int64_t>(core_->clock->nowMs()));
   ctx->trace = std::make_shared<detail::TaskTraceLogger>(
       tree->rootNode(), ctx->node_stats, ctx->activity, core_->clock);
-  // Groot2 实时可视化(M7):端口被占用等异常只告警,不影响任务执行
+  // Groot2 实时可视化(M7):端口被占用等异常只告警,不影响任务执行。
+  // BT.CPP 以 BTCPP_GROOT_INTERFACE 编译期开关裁剪 Groot2Publisher 符号
+  // (无导出宏,库无法探测),由 NEBULABT_WITH_GROOT2 同步决定
+#ifndef NEBULABT_NO_GROOT2
   if (spec.groot2_port != 0) {
     try {
       ctx->groot2 = std::make_shared<BT::Groot2Publisher>(*tree,
@@ -416,6 +421,13 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
                      std::to_string(spec.groot2_port) + " failed: " + e.what());
     }
   }
+#else
+  if (spec.groot2_port != 0) {
+    core_->logf(LogLevel::Warn,
+                "groot2_port ignored: built without Groot2 support "
+                "(-DNEBULABT_WITH_GROOT2=ON to enable)");
+  }
+#endif
   {
     // 断点恢复(M2):从上一轮 journal 提取已完成的检查点快照
     std::lock_guard<std::mutex> lk(ctx->journal_mu);

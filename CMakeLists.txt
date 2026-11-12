@@ -34,12 +34,12 @@ set(NEBULABT_BT_CPP_SOURCE_DIR "" CACHE PATH
 find_package(behaviortree_cpp 4 QUIET)
 if(NOT behaviortree_cpp_FOUND)
   include(FetchContent)
-  # Keep BT.CPP lean: no tools, no examples, no tests, no sqlite/zmq extras.
+  # Keep BT.CPP lean: no tools, no examples, no tests, no sqlite extras.
   set(BTCPP_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(BTCPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   set(BTCPP_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(BTCPP_SQLITE_LOGGING OFF CACHE BOOL "" FORCE)
-  set(BTCPP_GROOT_INTERFACE OFF CACHE BOOL "" FORCE)
+  set(BTCPP_GROOT_INTERFACE ${NEBULABT_WITH_GROOT2} CACHE BOOL "" FORCE)
   set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
   if(NEBULABT_BT_CPP_SOURCE_DIR)
     FetchContent_Declare(behaviortree_cpp
@@ -99,6 +99,14 @@ if(NEBULABT_WITH_YAML)
   find_package(yaml-cpp REQUIRED)
   target_link_libraries(nebulabt PUBLIC yaml-cpp)
   target_compile_definitions(nebulabt PUBLIC NEBULABT_HAVE_YAML)
+endif()
+
+# Groot2 实时可视化(M7):BT.CPP 编译期开启 BTCPP_GROOT_INTERFACE 才有
+# Groot2Publisher 符号(需 ZeroMQ;CI/系统包默认带)。显式关闭本选项时,
+# 代码以 NEBULABT_NO_GROOT2 守护,TaskSpec.groot2_port 仅告警不生效
+option(NEBULABT_WITH_GROOT2 "Enable Groot2 live visualization (needs ZeroMQ)" ON)
+if(NOT NEBULABT_WITH_GROOT2)
+  target_compile_definitions(nebulabt PUBLIC NEBULABT_NO_GROOT2)
 endif()
 
 if(NEBULABT_BUILD_EXAMPLES)
