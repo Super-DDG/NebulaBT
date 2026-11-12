@@ -13,10 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compiler: ["g++-11", "g++-12"]
+        # CC/CXX 必须分别是 C/C++ 编译器:CC 填 g++ 会挂掉 CMake 的 C 编译器测试
+        compiler: ["gcc-11", "gcc-12"]
     env:
       CC: ${{ matrix.compiler }}
-      CXX: ${{ matrix.compiler }}
+      CXX: ${{ matrix.compiler == 'gcc-11' && 'g++-11' || 'g++-12' }}
     steps:
       - uses: actions/checkout@v4
 

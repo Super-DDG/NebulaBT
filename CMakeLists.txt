@@ -15,6 +15,9 @@ option(NEBULABT_BUILD_BENCH "Build the core performance benchmark" ON)
 # 树包清单可选 YAML 支持(规范格式为 pack.json,零依赖不变;
 # 开启后 <pack>/pack.yaml 亦可,需系统安装 yaml-cpp)
 option(NEBULABT_WITH_YAML "Support pack.yaml manifests via yaml-cpp" OFF)
+# Groot2 实时可视化(M7):BT.CPP 编译期开启 BTCPP_GROOT_INTERFACE 才有
+# Groot2Publisher 符号(需 ZeroMQ)。选项必须在 FetchContent 之前声明
+option(NEBULABT_WITH_GROOT2 "Enable Groot2 live visualization (needs ZeroMQ)" ON)
 
 # 消毒器(测试加固):address | undefined | thread | 组合(逗号分隔)
 #   cmake -S . -B build-asan -DNEBULABT_SANITIZE=address
@@ -101,10 +104,9 @@ if(NEBULABT_WITH_YAML)
   target_compile_definitions(nebulabt PUBLIC NEBULABT_HAVE_YAML)
 endif()
 
-# Groot2 实时可视化(M7):BT.CPP 编译期开启 BTCPP_GROOT_INTERFACE 才有
-# Groot2Publisher 符号(需 ZeroMQ;CI/系统包默认带)。显式关闭本选项时,
-# 代码以 NEBULABT_NO_GROOT2 守护,TaskSpec.groot2_port 仅告警不生效
-option(NEBULABT_WITH_GROOT2 "Enable Groot2 live visualization (needs ZeroMQ)" ON)
+# Groot2 实时可视化(M7):显式关闭时以 NEBULABT_NO_GROOT2 守护,
+# TaskSpec.groot2_port 仅告警不生效(选项声明在文件顶部:FetchContent
+# 之前必须已可读取)
 if(NOT NEBULABT_WITH_GROOT2)
   target_compile_definitions(nebulabt PUBLIC NEBULABT_NO_GROOT2)
 endif()
