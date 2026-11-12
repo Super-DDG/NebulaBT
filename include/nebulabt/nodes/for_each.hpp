@@ -9,9 +9,18 @@
 /// - 子节点 FAILURE -> 默认整体 FAILURE;continue_on_failure=true 时跳过继续
 /// 空数组直接 SUCCESS。
 ///
-/// array 支持 vector<string> 黑板值,或 ";" 分隔的字符串。
+/// array 支持(按黑板实际类型自动分发):
+/// - vector<string>(兼容路径)
+/// - nlohmann::json 数组(结构化黑板):字符串元素写 element(string);
+///   对象/数值元素写 element(dump 字符串)与 element_json(真实 json,
+///   供下游 `ctx.in<nlohmann::json>("element_json")` 结构化消费)
+/// - ";" 分隔的字符串
+///
+/// 注意:array 端口为无类型端口——类型化端口会把绑定的黑板键钉成
+/// vector<string>,json 数组将无法注入(ReactiveGuard 同款教训)。
 
 #include <behaviortree_cpp/control_node.h>
+#include <behaviortree_cpp/contrib/json.hpp>
 #include <string>
 #include <vector>
 
@@ -27,7 +36,12 @@ public:
   void halt() override;
 
 private:
+  /// 解析 array 端口(vector<string> / json 数组 / ';' 字面量)
+  std::vector<std::string> resolveArray();
+
   std::vector<std::string> items_;
+  nlohmann::json json_array_ = nullptr;  // json 数组来源时保存;字符串来源为 null
+  nlohmann::json current_json_ = nullptr;  // 当前元素(json 来源时非 null)
   size_t index_ = 0;
 };
 

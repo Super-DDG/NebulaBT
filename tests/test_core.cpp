@@ -2139,6 +2139,158 @@ static void test_reactive_side_effects() {
   }
 }
 
+// Probe2:记录黑板原始类型(无 schema 注入规则验证)
+class Probe2 : public NebulaAction {
+public:
+  nlohmann::json flag;
+  nlohmann::json rows;
+  BT::PortsList providedPorts() const override { return {}; }
+  NodeStatus start(NebulaCtx& ctx, const Done&) override {
+    flag = ctx.peek("flag");
+    rows = ctx.peek("rows");
+    return NodeStatus::SUCCESS;
+  }
+};
+
+// ---- backlog:提交原因 / 结构化黑板 / LLM 超时 ----
+static void test_backlog_batch() {
+  // 1) TaskHandle.error():被拒提交携带可编程的原因
+  {
+    Engine engine;
+    engine.registerAction("Ok", std::make_shared<Ok>());
+    engine.registerAction("Forever", std::make_shared<Forever>());
+
+    // 校验失败:原因含首个错误
+    TaskSpec bad;
+    bad.schema = nlohmann::json{
+        {"slots", {{"must", {{"type", "int"}, {"required", true}}}}}};
+    bad.slots["wrong_key"] = 1;
+    auto t1 = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Ok/></BehaviorTree></root>)",
+      bad);
+    CHECK(!t1);
+    CHECK(t1.error().find("validation failed") != std::string::npos);
+    CHECK(t1.error().find("first:") != std::string::npos);
+
+    // 无 pack:原因含 task_type
+    TaskSpec nopack;
+    nopack.task_type = "NO_SUCH_TYPE";
+    auto t2 = engine.submitTask(nopack);
+    CHECK(!t2);
+    CHECK(t2.error().find("no loaded pack provides task_type 'NO_SUCH_TYPE'") !=
+          std::string::npos);
+
+    // 资源冲突:原因含资源名
+    const char* xml = R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Forever/></BehaviorTree></root>)";
+    TaskSpec a; a.task_id = "ra"; a.resources = {"gripper"};
+    auto ta = engine.submitFromText(xml, a);
+    CHECK(bool(ta));
+    TaskSpec b; b.task_id = "rb"; b.resources = {"gripper"};
+    auto tb = engine.submitFromText(xml, b);
+    CHECK(!tb);
+    CHECK(tb.error().find("resource 'gripper'") != std::string::npos);
+    CHECK(ta.cancel());
+    CHECK(ta.waitFor(std::chrono::milliseconds(500)) == TaskState::Canceled);
+  }
+
+  // 2) 结构化黑板:json 数组 slots → ForEach element_json 结构化消费
+  {
+    Engine engine;
+    auto observed = std::make_shared<std::vector<std::string>>();
+    class Probe : public NebulaAction {
+    public:
+      std::shared_ptr<std::vector<std::string>> out;
+      BT::PortsList providedPorts() const override {
+        return { BT::InputPort<std::string>("sku"),
+                 BT::InputPort<nlohmann::json>("item") };
+      }
+      NodeStatus start(NebulaCtx& ctx, const Done&) override {
+        const nlohmann::json item = ctx.in<nlohmann::json>("item");
+        out->push_back(ctx.in<std::string>("sku") + ":" +
+                       std::to_string(item.value("qty", 0)) + ":" +
+                       item.value("kind", "?"));
+        return NodeStatus::SUCCESS;
+      }
+    };
+    auto probe = std::make_shared<Probe>();
+    probe->out = observed;
+    engine.registerAction("Probe", probe);
+
+    TaskSpec spec;
+    // schema 声明 json_array:黑板按真实 json 存储
+    spec.schema = nlohmann::json{
+        {"slots", {{"items", {{"type", "json_array"}, {"required", true}}}}}};
+    spec.slots["items"] = nlohmann::json::array({
+        nlohmann::json{{"sku", "a1"}, {"qty", 2}, {"kind", "book"}},
+        nlohmann::json{{"sku", "b2"}, {"qty", 1}, {"kind", "toy"}},
+    });
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <ForEach array="{items}" element="{item_s}" element_json="{item}">
+          <Probe sku="{item_s}" item="{item}"/>
+        </ForEach>
+      </BehaviorTree></root>)", spec);
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(observed->size() == 2);
+    CHECK((*observed)[0] == "a1:2:book");
+    CHECK((*observed)[1] == "b2:1:toy");
+  }
+
+  // 3) 无 schema 注入升级:bool 真实类型 + 对象数组真实 json
+  {
+    Engine engine;
+    auto probe = std::make_shared<Probe2>();
+    engine.registerAction("Probe2", probe);
+    TaskSpec spec;
+    spec.slots["flag"] = true;                      // 旧规则 dump 成 "true"
+    spec.slots["rows"] = nlohmann::json::array({   // 旧规则逐元素 dump
+        nlohmann::json{{"k", "v"}}});
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t"><Probe2/></BehaviorTree></root>)",
+      spec);
+    CHECK(task.wait() == TaskState::Succeeded);
+    CHECK(probe->flag.is_boolean() && probe->flag.get<bool>());
+    CHECK(probe->rows.is_array() && probe->rows[0]["k"] == "v");
+  }
+
+  // 4) LLM 节点级超时:挂起客户端 → LLM_TIMEOUT;timeout_ms=0 关闭
+  {
+    Engine engine;
+    LlmDecision::Client hanging = [](const nlohmann::json&, Done) {
+      std::this_thread::sleep_for(std::chrono::seconds(10));  // 永不 done
+    };
+    engine.registerAction("LLMDecision",
+                          std::make_shared<LlmDecision>(hanging));
+
+    TaskSpec spec;
+    spec.slots["situation"] = "x";
+    spec.schema = nlohmann::json{
+        {"slots", {{"situation", {{"type", "string"}, {"required", true}}}}}};
+    auto t1 = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <LLMDecision prompt="{situation}" branches="a,b" branch="{d}"
+                     timeout_ms="120"/>
+      </BehaviorTree></root>)", spec);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(t1.wait() == TaskState::Failed);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() <
+          3000);
+    CHECK(t1.failures()[0].code == "LLM_TIMEOUT");
+
+    // timeout_ms=0:关闭节点级超时 → 任务保持 RUNNING,由取消收尾
+    auto t2 = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <LLMDecision prompt="{situation}" branches="a,b" branch="{d}"
+                     timeout_ms="0"/>
+      </BehaviorTree></root>)", spec);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(t2.state() == TaskState::Running);
+    CHECK(t2.cancel());
+  }
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";

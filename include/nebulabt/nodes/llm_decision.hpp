@@ -22,8 +22,11 @@
 ///
 /// - request 格式:{"context": <prompt 端口>, "branches": [...]}
 ///   期望结果:{"branch": "...", "reason": "..."}(reason 可选)
-/// - 失败码:LLM_NO_BRANCHES / LLM_INVALID_BRANCH / 客户端异常走
-///   ACTION_EXCEPTION;建议 Engine::declareFailureCodes 登记
+/// - 失败码:LLM_NO_BRANCHES / LLM_INVALID_BRANCH / LLM_TIMEOUT /
+///   客户端异常走 ACTION_EXCEPTION;建议 Engine::declareFailureCodes 登记
+/// - 节点级超时:timeout_ms 端口(默认 30000;0 = 关闭,交给任务级
+///   超时/watchdog)。超时经看门狗线程以 LLM_TIMEOUT 失败——LLM 挂起
+///   不应拖死整棵树
 ///
 /// 与 Checkpoint/ReactiveGuard/RetryWithDelay 组合即 agent 骨架:
 /// 决策可恢复、可守护、可重试,explain 就是完整执行轨迹。

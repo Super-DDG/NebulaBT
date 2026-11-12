@@ -132,7 +132,9 @@ private:
   TaskHandle submitFromFile(const std::string& xmlPath, TaskSpec spec,
                             const std::string& packName,
                             const std::string& packVersion);
-  bool validateTask(BT::Tree& tree, const TaskSpec& spec) const;
+  /// 提交校验:返回错误列表(空 = 通过);错误同时经引擎日志上报
+  std::vector<std::string> validateTask(BT::Tree& tree,
+                                        const TaskSpec& spec) const;
 
   std::shared_ptr<detail::EngineCore> core_;
 };

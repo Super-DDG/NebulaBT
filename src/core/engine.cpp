@@ -140,11 +140,14 @@ TaskHandle Engine::submitFromText(const std::string& xmlText, TaskSpec spec) {
     tree = std::make_shared<BT::Tree>(
         core_->factory.createTreeFromText(xmlText));
   } catch (const std::exception& e) {
-    core_->logf(LogLevel::Error, "create tree failed: " + std::string(e.what()));
-    return TaskHandle();
+    const std::string reason = "create tree failed: " + std::string(e.what());
+    core_->logf(LogLevel::Error, reason);
+    return TaskHandle(reason);
   }
-  if (!validateTask(*tree, spec)) {
-    return TaskHandle();
+  const auto errors = validateTask(*tree, spec);
+  if (!errors.empty()) {
+    return TaskHandle("validation failed (" + std::to_string(errors.size()) +
+                      " error(s), first: " + errors.front() + ")");
   }
   return submitTree(std::move(tree), std::move(spec));
 }
@@ -165,11 +168,14 @@ TaskHandle Engine::submitFromFile(const std::string& xmlPath, TaskSpec spec,
     tree = std::make_shared<BT::Tree>(
         core_->factory.createTreeFromFile(xmlPath));
   } catch (const std::exception& e) {
-    core_->logf(LogLevel::Error, "create tree failed: " + std::string(e.what()));
-    return TaskHandle();
+    const std::string reason = "create tree failed: " + std::string(e.what());
+    core_->logf(LogLevel::Error, reason);
+    return TaskHandle(reason);
   }
-  if (!validateTask(*tree, spec)) {
-    return TaskHandle();
+  const auto errors = validateTask(*tree, spec);
+  if (!errors.empty()) {
+    return TaskHandle("validation failed (" + std::to_string(errors.size()) +
+                      " error(s), first: " + errors.front() + ")");
   }
   return submitTree(std::move(tree), std::move(spec), packName, packVersion);
 }
@@ -294,10 +300,10 @@ TaskHandle Engine::submitTask(TaskSpec spec) {
   const detail::EngineCore::PackEntry* entry =
       core_->resolveTask(spec.task_type, spec.pack_version, spec.task_id);
   if (!entry) {
-    core_->logf(LogLevel::Error,
-                "submitTask: no loaded pack provides task_type '" +
-                    spec.task_type + "'");
-    return TaskHandle();
+    const std::string reason = "no loaded pack provides task_type '" +
+                               spec.task_type + "'";
+    core_->logf(LogLevel::Error, "submitTask: " + reason);
+    return TaskHandle(reason);
   }
   const auto& task = entry->manifest.tasks.at(spec.task_type);
   if (spec.schema.empty()) {
@@ -325,7 +331,8 @@ void Engine::setCanary(const std::string& packName, const std::string& version,
   core_->canary = {packName, version, percent};
 }
 
-bool Engine::validateTask(BT::Tree& tree, const TaskSpec& spec) const {
+std::vector<std::string> Engine::validateTask(BT::Tree& tree,
+                                              const TaskSpec& spec) const {
   std::vector<std::string> errors;
   const auto defs = parseSlotSchema(spec.schema, errors);
   auto slotErrors = validateSlotsAgainstSchema(defs, spec.slots);
@@ -339,13 +346,10 @@ bool Engine::validateTask(BT::Tree& tree, const TaskSpec& spec) const {
   for (const auto& w : detail::warnSideEffectsUnderReactive(tree)) {
     core_->logf(LogLevel::Warn, "validation warning: " + w);
   }
-  if (errors.empty()) {
-    return true;
-  }
   for (const auto& e : errors) {
     core_->logf(LogLevel::Error, "validation: " + e);
   }
-  return false;
+  return errors;
 }
 
 std::vector<std::string> Engine::validate(const std::string& xmlText,
@@ -484,7 +488,7 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
     core_->logf(LogLevel::Error,
                 "submit rejected: " + rejectReason + " (task '" +
                     spec.task_id + "')");
-    return TaskHandle();
+    return TaskHandle(rejectReason);
   }
   TaskHandle handle(ctx, core_);
   core_->appendJournal(
@@ -505,10 +509,11 @@ TaskHandle Engine::submitTree(std::shared_ptr<BT::Tree> tree, TaskSpec spec,
       core_->active.erase(spec.task_id);
       core_->task_resources.erase(spec.task_id);
     }
+    const std::string reason =
+        "scheduler queue full or stopped";
     core_->logf(LogLevel::Error,
-                "submit rejected: scheduler queue full or stopped (task '" +
-                    spec.task_id + "')");
-    return TaskHandle();
+                "submit rejected: " + reason + " (task '" + spec.task_id + "')");
+    return TaskHandle(reason);
   }
 
   // 策略:任务级超时(调度线程回调;到点未终态则 halt + TASK_TIMEOUT)

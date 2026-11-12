@@ -38,6 +38,10 @@ nlohmann::json anyToJson(LockedAny& entry) {
       }
       return arr;
     }
+    if (t == typeid(nlohmann::json)) {
+      // 结构化黑板:json 值原样导出(explain 输入快照 / peek / CheckSlot)
+      return entry->template cast<nlohmann::json>();
+    }
   } catch (const std::exception&) {
     // 不支持的类型返回 null,调用方自行跳过
   }

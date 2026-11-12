@@ -65,8 +65,17 @@ class TaskHandle {
 public:
   TaskHandle() = default;
 
+  /// 被拒绝的提交:空句柄 + 拒绝原因(Engine 内部构造)
+  explicit TaskHandle(std::string submitError) : error_(std::move(submitError)) {}
+
   explicit operator bool() const { return static_cast<bool>(ctx_); }
   bool empty() const { return !ctx_; }
+
+  /// 提交被拒时的原因(资源冲突/上限/校验失败/解析失败等);
+  /// 成功提交返回空串。配合 operator bool 使用:
+  ///   auto task = engine.submitTask(spec);
+  ///   if (!task) { log(task.error()); }
+  std::string error() const { return error_; }
 
   std::string taskId() const;
   TaskState state() const;
@@ -97,6 +106,7 @@ private:
 
   std::shared_ptr<detail::TaskContext> ctx_;
   std::shared_ptr<detail::EngineCore> core_;
+  std::string error_;  // 仅被拒提交:拒绝原因
 };
 
 } // namespace nebulabt

@@ -14,6 +14,9 @@ bool jsonMatchesType(const nlohmann::json& v, const std::string& type) {
     }
     return true;
   }
+  // 结构化黑板:任意 JSON 值 / JSON 数组,黑板按真实 json 存储
+  if (type == "json") return !v.is_discarded();
+  if (type == "json_array") return v.is_array();
   return false;
 }
 

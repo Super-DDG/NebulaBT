@@ -214,6 +214,8 @@ void halt(NebulaCtx& ctx) override {
 | `out<T>(port, value)` | 写输出端口(须在 ports 中声明) |
 | `fail(code, message)` | 记录结构化失败(自动附带节点名/时间戳) |
 | `inputsJson()` | 全部输入端口快照(调试/录制用) |
+| `inRef(port)` | 端口绑定的黑板键名(动态按键访问;字面量绑定返回空) |
+| `peek(key)` | 按名字读黑板键(缺失返回 null;与 inRef 组合支撑 CheckSlot 类原语) |
 | `taskId()` / `taskType()` | 当前任务标识 |
 
 ---
@@ -329,8 +331,11 @@ spec.groot2_port = 1667;                // Groot2 实时可视化(0 = 关,默认
 | slots 中的 JSON 类型 | 黑板中的类型 |
 |---|---|
 | string | string |
-| array | `vector<string>`(ForEach 直接可用) |
-| int/double/bool | **schema 声明了对应类型时**按真实类型注入;否则 dump 为 string |
+| array(全字符串) | `vector<string>`(ForEach 直接可用) |
+| bool | **真实 bool**(旧版 dump 为字符串;现无需 schema 即为真实类型) |
+| array(含对象/混合) | **真实 json 数组**(结构化黑板;ForEach `element_json` 可消费) |
+| int/double | **schema 声明了对应类型时**按真实类型注入;否则 dump 为 string |
+| json / json_array(schema 类型) | 真实 json(schema 声明即按结构化存储) |
 
 ### 6.3 三种提交方式
 
@@ -352,6 +357,9 @@ task.cancel();                     // 取消:halt 全树 → 各动作 halt() �
 task.failures();                   // 结构化失败快照
 task.journal();                    // 事件日志快照(可整体作为 resume_journal)
 task.explain();                    // 完整执行报告(见 §8)
+
+// 被拒提交:空句柄 + 可编程原因(资源冲突/上限/校验失败等)
+if (!task) { std::cerr << task.error() << "\n"; }
 
 engine.onFinished([](TaskHandle t) { /* 终态回调,调度线程执行,应快速返回 */ });
 ```
@@ -676,7 +684,7 @@ engine.advanceTime(1000);              // 重试即刻到期,测试不真睡
 
 | 节点 | 端口 | 语义 |
 |---|---|---|
-| `ForEach` | array, element(out), continue_on_failure | 集合遍历;元素写入黑板;失败默认上抛 |
+| `ForEach` | array, element(out), element_json(out), continue_on_failure | 集合遍历;vector<string>、json 数组或 ';' 字符串;json 数组的对象元素经 `element_json`(真实 json)供下游结构化消费 |
 | `WhileLoop` | max_iterations(默认 1000) | condition+body 真 while;body SUCCESS 后重估条件;condition FAILURE = 正常退出(SUCCESS) |
 | `SwitchN` | variable, case_1..case_32 | 分发;default 恒为最后一个子节点 |
 | `RetryWithDelay` | attempts, delay_ms, budget_ms | 重试;次数与墙钟任一用尽即失败 |
@@ -733,6 +741,7 @@ engine.advanceTime(1000);              // 重试即刻到期,测试不真睡
 | `GUARD_VIOLATED` | 框架 | ReactiveGuard 条件破坏(fail-closed) |
 | `COMPENSATION_FAILED` | 框架 | 补偿子树未成功;不影响其余补偿继续 |
 | `LLM_INVALID_BRANCH` | 框架 | LLM 输出不在允许分支集(幻觉拦截) |
+| `LLM_TIMEOUT` | 框架 | LLM 客户端超过 `timeout_ms` 未响应(节点级超时) |
 | `LLM_NO_BRANCHES` | 框架 | LLMDecision 的 branches 端口为空 |
 | `PORT_OUTPUT_ERROR` | SDK | `ctx.out` 写端口失败(端口未声明等) |
 | 你的业务码 | 你 | 全大写下划线;**建议进登记表**(见 8.2.1) |

@@ -281,7 +281,7 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
 - explain(M7 后)在任务 RUNNING 时安全可用:树遍历经调度线程快照 job。
   唯一限制:不要**从调度线程自身**(如 onFinished 之外的调度上下文)调用
   ——会等到 2s 超时并返回无树快照;终态后调用走直接遍历,无此限制
-- 未提供 schema 时,slots 注入规则为 string / array→vector<string> / 其它 dump;
+- 未提供 schema 时,slots 注入规则:string / bool→真实 bool / 数组全字符串→vector<string> / 含对象数组→真实 json / 其它 dump;
   提供后标量类型按真实类型注入
 - L2 数据流检查不覆盖 Script/ScriptCondition 代码串中引用的键
 - Checkpoint 快照支持 string/int/int64/double/bool/vector<string>,其它类型跳过

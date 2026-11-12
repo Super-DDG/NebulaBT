@@ -108,15 +108,38 @@ void injectSlots(BT::Tree& tree, const TaskSpec& spec,
         continue;
       }
     }
+    // schema 声明的 json 类型:黑板存真实 json(结构化黑板)
+    if (defIt != defs.end() && (defIt->second.type == "json" ||
+                                defIt->second.type == "json_array")) {
+      bb->set(it.key(), v);
+      continue;
+    }
     if (v.is_string()) {
       bb->set(it.key(), v.get<std::string>());
+    } else if (v.is_boolean()) {
+      // 无 schema 时 bool 按真实类型注入(旧规则 dump 成 "true" 字符串,
+      // 是 ReactiveGuard/类型钉死一类坑的根源)
+      bb->set(it.key(), v.get<bool>());
     } else if (v.is_array()) {
-      std::vector<std::string> vec;
-      vec.reserve(v.size());
+      bool allStrings = true;
       for (const auto& e : v) {
-        vec.push_back(e.is_string() ? e.get<std::string>() : e.dump());
+        if (!e.is_string()) {
+          allStrings = false;
+          break;
+        }
       }
-      bb->set(it.key(), vec);
+      if (allStrings) {
+        // 兼容路径:string 数组 → vector<string>(ForEach/业务直接可用)
+        std::vector<std::string> vec;
+        vec.reserve(v.size());
+        for (const auto& e : v) {
+          vec.push_back(e.get<std::string>());
+        }
+        bb->set(it.key(), vec);
+      } else {
+        // 结构化数组(含对象/混合类型)→ 真实 json 数组
+        bb->set(it.key(), v);
+      }
     } else {
       bb->set(it.key(), v.dump());
     }
