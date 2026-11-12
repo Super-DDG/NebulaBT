@@ -27,5 +27,11 @@ void validateTreeKeys(const BT::Tree& tree,
 void injectSlots(BT::Tree& tree, const TaskSpec& spec,
                  const std::map<std::string, SlotDef>& defs);
 
+/// 加载期警告(不阻断):带副作用的装饰器(Compensable/Checkpoint)位于
+/// ReactiveSequence/ReactiveFallback 之下时,已完成节点会被 halt 复位并
+/// 重跑(BT reactive 语义)——副作用随之重复。返回警告文案列表
+std::vector<std::string> warnSideEffectsUnderReactive(const BT::Tree& tree);
+
+
 } // namespace detail
 } // namespace nebulabt

@@ -334,6 +334,11 @@ bool Engine::validateTask(BT::Tree& tree, const TaskSpec& spec) const {
     // schema 未启用时跳过 L2 数据流检查(向后兼容既有任务)
     detail::validateTreeKeys(tree, defs, errors);
   }
+  // 加载期警告(不阻断):副作用装饰器位于 reactive 父层下会被 halt
+  // 复位并重跑(BT reactive 语义),副作用随之重复
+  for (const auto& w : detail::warnSideEffectsUnderReactive(tree)) {
+    core_->logf(LogLevel::Warn, "validation warning: " + w);
+  }
   if (errors.empty()) {
     return true;
   }

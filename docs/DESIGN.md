@@ -291,6 +291,11 @@ nebula doc      <tree.xml>                 # 树 -> mermaid 流程图(M3)
   但掉电窗口内的半行只能靠解析容错
 - FailureRecord.attempt 暂未由 RetryWithDelay 自动填充(记录粒度到节点级)
 - `ForEachNode` 仅支持 string 集合;结构化元素待后续类型系统
+- **副作用节点勿置于 ReactiveSequence/ReactiveFallback 之下**:BT reactive
+  语义会对 RUNNING 节点的已完成兄弟 halt 复位并重跑(条件节点正需要如此),
+  Compensable/Checkpoint 及任何带副作用的动作随之重复执行。加载期
+  validateTask 对该结构发警告(不阻断);Compensable/Checkpoint 自带的
+  终态缓存只防御"非 halt 类重 tick"(自定义父层)
 - 补偿子树内不要再嵌 Compensable(嵌套补偿在 runCompensations 弹栈后
   入栈,条目无人消费;Saga 一层语义通常足够)
 - `NebulaCtx` 非线程安全:仅在 start/halt 调用栈内使用;跨线程失败

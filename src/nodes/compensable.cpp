@@ -19,6 +19,13 @@ BT::NodeStatus CompensableNode::tick() {
     throw BT::LogicError(
         "Compensable must have exactly 2 children (main work + compensation)");
   }
+  // 已武装(主工作 SUCCESS):非 halt 类重 tick(自定义父层)透传缓存态,
+  // 主工作(副作用)不重跑。注意 ReactiveSequence/Fallback 对 RUNNING
+  // 兄弟的已完成节点会 halt 复位(回到 IDLE 后重跑是 BT reactive 语义,
+  // 由加载期警告提示);WhileLoop 每轮迭代经 halt 重置,同样不受影响
+  if (status() == BT::NodeStatus::SUCCESS) {
+    return BT::NodeStatus::SUCCESS;
+  }
   if (status() == BT::NodeStatus::IDLE) {
     (void)getInput<std::string>("id", saga_id_);
     if (saga_id_.empty()) {

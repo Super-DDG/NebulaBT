@@ -2055,6 +2055,90 @@ task_types:
 #endif
 }
 
+// ---- 复审:副作用装饰器 × reactive 父层(BT 语义)----
+static void test_reactive_side_effects() {
+  class Count : public NebulaAction {
+  public:
+    std::atomic<int> calls{0};
+    BT::PortsList providedPorts() const override { return {}; }
+    NodeStatus start(NebulaCtx&, const Done&) override {
+      calls.fetch_add(1);
+      return NodeStatus::SUCCESS;
+    }
+  };
+  class Wait : public NebulaAction {
+  public:
+    BT::PortsList providedPorts() const override {
+      return { BT::InputPort<int>("ms") };
+    }
+    NodeStatus start(NebulaCtx& ctx, const Done& done) override {
+      std::thread([ms = ctx.in<int>("ms"), done] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        done(NodeStatus::SUCCESS, {});
+      }).detach();
+      return NodeStatus::RUNNING;
+    }
+  };
+
+  // 1) memory Sequence:Compensable/Checkpoint 各执行恰好一次
+  {
+    Engine engine;
+    auto count = std::make_shared<Count>();
+    engine.registerAction("Count", count);
+    engine.registerAction("Wait", std::make_shared<Wait>());
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <Sequence>
+          <Compensable id="work">
+            <Count/>
+            <Count/>
+          </Compensable>
+          <Checkpoint id="cp"><Count/></Checkpoint>
+          <Wait ms="30"/>
+        </Sequence>
+      </BehaviorTree></root>)");
+    CHECK(task.waitFor(std::chrono::seconds(1)) == TaskState::Succeeded);
+    CHECK(count->calls.load() == 2);  // Compensable 一次 + Checkpoint 一次,无重跑
+  }
+
+  // 2) reactive 父层:halt 复位重跑是 BT reactive 语义 → 副作用重复,
+  //    加载期必须发警告(提交路径 validateTask 捕获)
+  {
+    Engine engine;
+    auto count = std::make_shared<Count>();
+    engine.registerAction("Count", count);
+    engine.registerAction("Wait", std::make_shared<Wait>());
+    engine.registerAction("Forever", std::make_shared<Forever>());
+    std::atomic<int> warns{0};
+    engine.setLogger([&warns](LogLevel lv, const std::string& msg) {
+      if (lv == LogLevel::Warn && msg.find("reactive parent") != std::string::npos) {
+        warns.fetch_add(1);
+      }
+    });
+
+    auto task = engine.submitFromText(R"(
+      <root BTCPP_format="v4"><BehaviorTree ID="t">
+        <ReactiveSequence>
+          <Compensable id="work">
+            <Count/>
+            <Count/>
+          </Compensable>
+          <Checkpoint id="cp"><Count/></Checkpoint>
+          <Wait ms="30"/>
+          <Forever/>
+        </ReactiveSequence>
+      </BehaviorTree></root>)");
+    // tick1:Comp#1 + Cp#1,Wait RUNNING;30ms 后 done 唤醒 →
+    // tick2:halt 复位的 Compensable/Checkpoint 重跑(文档化语义),
+    // Wait SUCCESS → Forever RUNNING 保持任务活跃
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(task.cancel());
+    CHECK(task.waitFor(std::chrono::seconds(1)) == TaskState::Canceled);
+    CHECK(warns.load() >= 1);           // 加载期警告可见
+    CHECK(count->calls.load() == 4);    // 初次 2 次 + 唤醒重跑 2 次
+  }
+}
+
 int main() {
   test_sync_flow_and_explain();
   std::cout << "ok  sync flow + explain\n";
@@ -2126,6 +2210,8 @@ int main() {
                "     double done / bad journal header / guard period=0)\n";
   test_dynamic_access_and_yaml();
   std::cout << "ok  dynamic access (inRef/peek) + yaml manifest fidelity\n";
+  test_reactive_side_effects();
+  std::cout << "ok  reactive side effects (memory=once; reactive reruns + warning)\n";
   std::cout << "ALL TESTS PASSED\n";
   return 0;
 }

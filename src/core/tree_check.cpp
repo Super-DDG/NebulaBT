@@ -123,5 +123,36 @@ void injectSlots(BT::Tree& tree, const TaskSpec& spec,
   }
 }
 
+void walkReactive(const BT::TreeNode* node, bool underReactive,
+                  std::vector<std::string>& warnings) {
+  const std::string reg = node->registrationName();
+  const bool isReactive = reg == "ReactiveSequence" || reg == "ReactiveFallback";
+  if (underReactive && (reg == "Compensable" || reg == "Checkpoint")) {
+    warnings.push_back(std::string("node '") + node->name() + "' (" + reg +
+                       ") sits under a reactive parent: completed nodes are "
+                       "halt-reset and re-run on every wake, so its side "
+                       "effects repeat; place it under a memory Sequence "
+                       "(or make it idempotent)");
+  }
+  const bool childReactive = underReactive || isReactive;
+  if (auto ctrl = dynamic_cast<const BT::ControlNode*>(node)) {
+    for (const BT::TreeNode* child : ctrl->children()) {
+      walkReactive(child, childReactive, warnings);
+    }
+  } else if (auto dec = dynamic_cast<const BT::DecoratorNode*>(node)) {
+    if (dec->child()) {
+      walkReactive(dec->child(), childReactive, warnings);
+    }
+  }
+}
+
+std::vector<std::string> warnSideEffectsUnderReactive(const BT::Tree& tree) {
+  std::vector<std::string> warnings;
+  if (tree.rootNode()) {
+    walkReactive(tree.rootNode(), false, warnings);
+  }
+  return warnings;
+}
+
 } // namespace detail
 } // namespace nebulabt

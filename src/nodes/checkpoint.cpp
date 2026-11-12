@@ -81,6 +81,12 @@ void CheckpointNode::restoreSnapshot(const nlohmann::json& snapshot) {
 }
 
 BT::NodeStatus CheckpointNode::tick() {
+  // 快照已记录(SUCCESS):非 halt 类重 tick(自定义父层)透传缓存态,
+  // 子节点(副作用)不重跑。Reactive 父层对已完成节点 halt 复位后重跑
+  // 属 BT reactive 语义,由加载期警告提示;WhileLoop 迭代经 halt 重置
+  if (status() == BT::NodeStatus::SUCCESS) {
+    return BT::NodeStatus::SUCCESS;
+  }
   if (status() == BT::NodeStatus::IDLE) {
     cp_id_ = getInput<std::string>("id").value_or("");
     if (cp_id_.empty()) {

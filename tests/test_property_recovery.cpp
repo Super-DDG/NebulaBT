@@ -155,6 +155,15 @@ int main() {
         const int steps = static_cast<int>(rng() % 6);
         for (int s = 0; s <= steps; ++s) {
           engine.advanceTime(10 + rng() % 50);
+          // 每轮保证至少完成一个在途 done(存在时):否则 rng 连续抽到
+          // "不完成"会让 8 轮毫无进展而耗尽(CI DIAG round 16 实证)。
+          // 单调进展使耗尽在结构上不可能;"带着未完成在途动作崩溃"
+          // 的多样性由后续 rng 保留
+          if (!pending.empty()) {
+            auto done = pending.front();
+            pending.erase(pending.begin());
+            done(NodeStatus::SUCCESS, {});
+          }
           while (!pending.empty() && (rng() % 2) == 0) {
             auto done = pending.front();
             pending.erase(pending.begin());
@@ -166,11 +175,9 @@ int main() {
           }
         }
         // 结算前给调度线程一个有界排空窗口:advanceTime 已把到期定时器
-        // 物化为作业,落地只需真实毫秒级时间。此前的 waitFor(0) 是与
-        // 调度线程的竞速,偶发把"差最后一次 tick 就完成"误判为崩溃,
-        // 轮次被无谓消耗直至耗尽(CI gcc-12 偶发 CHECK(succeeded) 失败)。
-        // 仍在等待未触发虚拟定时器的任务这里不会完成,照常按崩溃恢复。
-        succeeded = task.waitFor(std::chrono::milliseconds(200)) ==
+        // 物化为作业,落地只需真实毫秒级时间。仍在等待未触发虚拟定时器
+        // 的任务这里不会完成,照常按崩溃恢复。50ms 对作业排空远超裕量
+        succeeded = task.waitFor(std::chrono::milliseconds(50)) ==
                     TaskState::Succeeded;
       }  // 引擎析构:任务未终态则取消 = 模拟崩溃
 
